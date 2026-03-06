@@ -25,7 +25,7 @@ type Connection struct {
 	sock *unet.Socket
 	fd   int
 
-	// peer address
+	// peer addresses
 	remoteAddr unet.Address
 	localAddr  unet.Address
 
@@ -43,10 +43,13 @@ type Connection struct {
 	sendN    int      // number of pending datagrams in current batch
 
 	// stream management
-	streamMu   sync.RWMutex
-	streams    map[uint32]*Stream
-	nextStream uint32 // next stream ID to allocate
-	acceptCh   chan *Stream
+	streamMu          sync.RWMutex
+	streams           map[uint32]*Stream
+	nextStream        uint32 // next stream ID to allocate
+	acceptCh          chan *Stream
+	sReadReorderBuff  map[uint32]map[uint32][]byte // out-of-order data waiting for missing sequence numbers
+	sReadReorderCount map[uint32]int               // total buffered out-of-order bytes
+	sReadReorderMax   int                          // max buffer size for out-of-order data per stream
 
 	// connection lifecycle
 	closed   atomic.Bool
@@ -62,15 +65,17 @@ type Connection struct {
 // The socket must be a UDP socket with NearAddr and FarAddr set.
 func newConnection(sock *unet.Socket, fd int, remote unet.Address, connID uint64, isClient bool, cfg config) *Connection {
 	c := &Connection{
-		cfg:        cfg,
-		connID:     connID,
-		sock:       sock,
-		fd:         fd,
-		remoteAddr: remote,
-		streams:    make(map[uint32]*Stream, 64),
-		acceptCh:   make(chan *Stream, cfg.maxStreams),
-		closeCh:    make(chan struct{}),
-		isClient:   isClient,
+		cfg:              cfg,
+		connID:           connID,
+		sock:             sock,
+		fd:               fd,
+		remoteAddr:       remote,
+		streams:          make(map[uint32]*Stream, 64),
+		acceptCh:         make(chan *Stream, cfg.maxStreams),
+		closeCh:          make(chan struct{}),
+		isClient:         isClient,
+		sReadReorderBuff: make(map[uint32]map[uint32][]byte),
+		sReadReorderMax:  10000,
 	}
 
 	// Client-initiated streams use odd IDs (1,3,5,...).
@@ -84,6 +89,7 @@ func newConnection(sock *unet.Socket, fd int, remote unet.Address, connID uint64
 	c.sock.GetNearAddress(&c.localAddr)
 
 	// Set up batched receive endpoint.
+	c.sReadReorderCount = make(map[uint32]int)
 	c.recvBufs = make([][]byte, cfg.batchSize)
 	recvIdx := 0
 	c.recvEP.SetupVectors(cfg.batchSize, 1, func(iov []syscall.Iovec) {
@@ -356,8 +362,45 @@ func (c *Connection) handleData(f frame) {
 		return // stream not found, discard
 	}
 
-	// TODO: reorder by f.seq if needed (retransmission stub)
+	if s.readSeq > f.seq {
+		return // Frame already processed, discard
+	}
+
+	if c.sReadReorderCount[f.streamID] > c.sReadReorderMax {
+		// close the stream for excessive out-of-order buffering
+		s.deliverClose()
+		c.removeStream(f.streamID)
+		return
+	}
+
+	if s.readSeq < f.seq {
+		// Out-of-order frame, buffer for later
+		if c.sReadReorderBuff[f.streamID] == nil {
+			c.sReadReorderBuff[f.streamID] = make(map[uint32][]byte)
+
+		}
+		c.sReadReorderBuff[f.streamID][f.seq] = f.payload
+		c.sReadReorderCount[f.streamID] = c.sReadReorderCount[f.streamID] + 1
+		return
+	}
+
+	s.readSeq++
 	s.deliverData(f.payload)
+
+	// Initial implementation for out of order recovery
+	if c.sReadReorderBuff[f.streamID] != nil {
+		totalReorders := c.sReadReorderCount[f.streamID]
+		for i := 0; i < totalReorders; i++ {
+			if c.sReadReorderBuff[f.streamID][s.readSeq] != nil {
+				s.deliverData(c.sReadReorderBuff[f.streamID][s.readSeq])
+				delete(c.sReadReorderBuff[f.streamID], s.readSeq)
+				s.readSeq++
+				c.sReadReorderCount[f.streamID] = c.sReadReorderCount[f.streamID] - 1
+			} else {
+				break
+			}
+		}
+	}
 }
 
 func (c *Connection) handleStreamOpen(f frame) {

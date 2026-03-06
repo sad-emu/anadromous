@@ -20,6 +20,7 @@ type Stream struct {
 	readHead int    // next read position
 	readTail int    // next write position
 	readLen  int    // buffered bytes count
+	readSeq  uint32 // next expected sequence number
 	readCond *sync.Cond
 	readErr  error // sticky read error (io.EOF, ErrStreamClosed, etc.)
 
@@ -38,9 +39,11 @@ type Stream struct {
 
 func newStream(id uint32, conn *Connection, bufSize int) *Stream {
 	s := &Stream{
-		id:      id,
-		conn:    conn,
-		readBuf: make([]byte, bufSize),
+		id:       id,
+		conn:     conn,
+		readBuf:  make([]byte, bufSize),
+		readSeq:  0,
+		writeSeq: 0,
 	}
 	s.readCond = sync.NewCond(&s.readMu)
 	s.writeCond = sync.NewCond(&s.writeMu)
@@ -220,6 +223,7 @@ func (s *Stream) ringWrite(data []byte) {
 	cap_ := len(s.readBuf)
 	for len(data) > 0 {
 		if s.readLen >= cap_ {
+			// TODO change to block instead of drop data
 			// Buffer full — drop oldest data. Application must read fast enough.
 			break
 		}
