@@ -49,7 +49,8 @@ type Connection struct {
 	acceptCh          chan *Stream
 	sReadReorderBuff  map[uint32]map[uint32][]byte // out-of-order data waiting for missing sequence numbers
 	sReadReorderCount map[uint32]int               // total buffered out-of-order bytes
-	sReadReorderMax   int                          // max buffer size for out-of-order data per stream
+	sReadReorderMax   int                          // max count of out-of-order packets per stream
+	sReadIdsToAck     map[uint32][]uint32          // List of packet IDs to ACK for each stream
 
 	// connection lifecycle
 	closed   atomic.Bool
@@ -90,6 +91,7 @@ func newConnection(sock *unet.Socket, fd int, remote unet.Address, connID uint64
 
 	// Set up batched receive endpoint.
 	c.sReadReorderCount = make(map[uint32]int)
+	c.sReadIdsToAck = make(map[uint32][]uint32)
 	c.recvBufs = make([][]byte, cfg.batchSize)
 	recvIdx := 0
 	c.recvEP.SetupVectors(cfg.batchSize, 1, func(iov []syscall.Iovec) {
@@ -217,6 +219,17 @@ func (c *Connection) sendControlFrame(ftype uint8, streamID, seq uint32) error {
 	}
 	encodeHeader(buf, ftype, streamID, seq, 0)
 	return c.commitSendSlot(idx, frameHeaderSize)
+}
+
+// sendACKFrame sends an ACK frame acknowledging receipt of a set of data frames.
+// Seqs must already be sized appropriately for the frame payload.
+func (c *Connection) sendACKFrame(streamID uint32, seqs []uint32) error {
+	buf, idx, err := c.acquireSendSlot()
+	if err != nil {
+		return err
+	}
+	n := encodeAckFrame(buf, streamID, seqs)
+	return c.commitSendSlot(idx, n)
 }
 
 // acquireSendSlot reserves a slot in the send batch. If the batch is full,
@@ -373,11 +386,16 @@ func (c *Connection) handleData(f frame) {
 		return
 	}
 
+	if c.sReadIdsToAck[f.streamID] == nil {
+		c.sReadIdsToAck[f.streamID] = make([]uint32, 0)
+	}
+
+	c.sReadIdsToAck[f.streamID] = append(c.sReadIdsToAck[f.streamID], f.seq)
+
 	if s.readSeq < f.seq {
 		// Out-of-order frame, buffer for later
 		if c.sReadReorderBuff[f.streamID] == nil {
 			c.sReadReorderBuff[f.streamID] = make(map[uint32][]byte)
-
 		}
 		c.sReadReorderBuff[f.streamID][f.seq] = f.payload
 		c.sReadReorderCount[f.streamID] = c.sReadReorderCount[f.streamID] + 1

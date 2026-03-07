@@ -60,6 +60,17 @@ func encodeFrame(buf []byte, ftype uint8, streamID, seq uint32, payload []byte) 
 	return frameHeaderSize + int(plen)
 }
 
+// encodeAckFrame writes an ACK frame with a list of acknowledged sequence numbers.
+func encodeAckFrame(buf []byte, streamID uint32, seqs []uint32) int {
+	// ACK frame payload format: [StreamID(4) | Count(4) | Seq1(4) | Seq2(4) | ...]
+	binary.BigEndian.PutUint32(buf[0:4], streamID)
+	binary.BigEndian.PutUint32(buf[4:8], uint32(len(seqs)))
+	for i, seq := range seqs {
+		binary.BigEndian.PutUint32(buf[8+4*i:12+4*i], seq)
+	}
+	return 8 + 4*len(seqs)
+}
+
 // decodeHeader reads a frame header from buf (must be >= frameHeaderSize).
 func decodeHeader(buf []byte) (ftype uint8, streamID, seq, length uint32, err error) {
 	if len(buf) < frameHeaderSize {

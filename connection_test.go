@@ -48,9 +48,7 @@ func createTestFrame(connID uint32, streamID uint32, seq uint32, payload []byte)
 
 func TestConnectionInOrder(t *testing.T) {
 	_, server := newTestConnectionPair(t)
-	// TODO 1. emulate state after handshake
-	// 2. send a few in-order packets and verify they are received correctly
-	// 3. send a few out-of-order packets and verify they are buffered and delivered in order
+	// send a few in-order packets and verify they are received correctly
 	fakeConnectionId := uint32(1)
 	server.streams = make(map[uint32]*Stream) // reset streams map for testing
 	server.streams[fakeConnectionId] = newStream(fakeConnectionId, server, 1024)
@@ -73,15 +71,15 @@ func TestConnectionInOrder(t *testing.T) {
 
 func TestConnectionOutOfOrder(t *testing.T) {
 	_, server := newTestConnectionPair(t)
-	// TODO 1. emulate state after handshake
-	// 2. send a few in-order packets and verify they are received correctly
-	// 3. send a few out-of-order packets and verify they are buffered and delivered in order
+	// send a few out-of-order packets and verify they are buffered and delivered in order
 	fakeConnectionId := uint32(1)
 	server.streams = make(map[uint32]*Stream) // reset streams map for testing
 	server.streams[fakeConnectionId] = newStream(fakeConnectionId, server, 1024)
 	f1 := createTestFrame(uint32(fakeConnectionId), 1, 0, []byte("hello"))
 	f2 := createTestFrame(uint32(fakeConnectionId), 1, 1, []byte("world"))
 	f3 := createTestFrame(uint32(fakeConnectionId), 1, 2, []byte("!"))
+
+	// Order is reversed
 	server.handleData(f3)
 	server.handleData(f2)
 	server.handleData(f1)
