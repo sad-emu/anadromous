@@ -33,6 +33,10 @@ const maxPayloadSize = 1200
 // maxDatagramSize is the max full datagram size (header + payload).
 const maxDatagramSize = frameHeaderSize + maxPayloadSize
 
+// maxAckSeqsPerFrame is the maximum number of sequence numbers that fit in
+// a single ACK frame's payload: [Count(4) | Seq(4) x N] <= maxPayloadSize.
+const maxAckSeqsPerFrame = (maxPayloadSize - 4) / 4
+
 // frame represents a decoded frame header plus its payload.
 type frame struct {
 	ftype    uint8
@@ -60,15 +64,40 @@ func encodeFrame(buf []byte, ftype uint8, streamID, seq uint32, payload []byte) 
 	return frameHeaderSize + int(plen)
 }
 
-// encodeAckFrame writes an ACK frame with a list of acknowledged sequence numbers.
+// encodeAckFrame writes a complete ACK frame (header + payload) into buf.
+// The stream being acknowledged is carried in the generic header's StreamID
+// field; the payload is [Count(4) | Seq1(4) | Seq2(4) | ...].
+// len(seqs) must not exceed maxAckSeqsPerFrame.
 func encodeAckFrame(buf []byte, streamID uint32, seqs []uint32) int {
-	// ACK frame payload format: [StreamID(4) | Count(4) | Seq1(4) | Seq2(4) | ...]
-	binary.BigEndian.PutUint32(buf[0:4], streamID)
-	binary.BigEndian.PutUint32(buf[4:8], uint32(len(seqs)))
+	plen := uint32(4 + 4*len(seqs))
+	encodeHeader(buf, frameACK, streamID, 0, plen)
+	binary.BigEndian.PutUint32(buf[frameHeaderSize:frameHeaderSize+4], uint32(len(seqs)))
 	for i, seq := range seqs {
-		binary.BigEndian.PutUint32(buf[8+4*i:12+4*i], seq)
+		off := frameHeaderSize + 4 + 4*i
+		binary.BigEndian.PutUint32(buf[off:off+4], seq)
 	}
-	return 8 + 4*len(seqs)
+	return frameHeaderSize + int(plen)
+}
+
+// decodeAckFrame extracts the acknowledged sequence numbers from a decoded
+// ACK frame's payload. The acknowledged stream is f.streamID.
+func decodeAckFrame(f frame) (seqs []uint32, err error) {
+	if len(f.payload) < 4 {
+		err = errors.New("ack payload too small")
+		return
+	}
+	count := binary.BigEndian.Uint32(f.payload[0:4])
+	need := 4 + 4*int(count)
+	if len(f.payload) < need {
+		err = fmt.Errorf("ack payload truncated: have %d, need %d", len(f.payload), need)
+		return
+	}
+	seqs = make([]uint32, count)
+	for i := range seqs {
+		off := 4 + 4*i
+		seqs[i] = binary.BigEndian.Uint32(f.payload[off : off+4])
+	}
+	return
 }
 
 // decodeHeader reads a frame header from buf (must be >= frameHeaderSize).

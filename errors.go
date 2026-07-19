@@ -25,4 +25,8 @@ var (
 
 	// ErrPayloadTooLarge is returned when a write exceeds maxPayloadSize.
 	ErrPayloadTooLarge = errors.New("anadromous: payload too large for single datagram")
+
+	// ErrRetransmitExceeded is returned when a frame could not be delivered
+	// after the configured number of fixed-interval retransmit attempts.
+	ErrRetransmitExceeded = errors.New("anadromous: retransmit attempts exceeded")
 )

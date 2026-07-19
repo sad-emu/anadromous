@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/tredeske/u/unet"
@@ -52,11 +53,35 @@ type Connection struct {
 	sReadReorderMax   int                          // max count of out-of-order packets per stream
 	sReadIdsToAck     map[uint32][]uint32          // List of packet IDs to ACK for each stream
 
+	// recvMu serializes datagram processing. Normally only readLoop calls
+	// handleDatagram, but Listener.readLoop's fallback path can also forward
+	// a stray datagram to an established connection from a different
+	// goroutine, so the state mutations above need protection.
+	recvMu sync.Mutex
+
+	// retransmit tracks unacknowledged DATA frames for fixed-interval,
+	// no-backoff retransmission.
+	retransmit *retransmitQueue
+
+	// onClose, if set, is invoked once when the connection closes (used by
+	// Listener to remove the connection from its tracking map).
+	onClose func()
+
+	// established is closed once the handshake completes (client side).
+	establishedCh   chan struct{}
+	establishedOnce sync.Once
+
 	// connection lifecycle
 	closed   atomic.Bool
 	closeCh  chan struct{}
 	closeErr error
 	doneWg   sync.WaitGroup
+
+	// Statuses (accessed from the public API concurrently with readLoop, so
+	// these must be atomic rather than plain fields).
+	sendPingMs  atomic.Int64
+	rttMs       atomic.Int64
+	missedPongs int32
 
 	// role: true if this side initiated the connection (client)
 	isClient bool
@@ -77,14 +102,22 @@ func newConnection(sock *unet.Socket, fd int, remote unet.Address, connID uint64
 		isClient:         isClient,
 		sReadReorderBuff: make(map[uint32]map[uint32][]byte),
 		sReadReorderMax:  10000,
+		retransmit:       newRetransmitQueue(),
+		establishedCh:    make(chan struct{}),
 	}
+	c.rttMs.Store(-1)
 
 	// Client-initiated streams use odd IDs (1,3,5,...).
 	// Server-initiated streams use even IDs (2,4,6,...).
 	if isClient {
 		c.nextStream = 1
+		c.closed.Store(false)
 	} else {
 		c.nextStream = 2
+		c.closed.Store(false)
+		// Server-side connections are usable as soon as they're created
+		// (the handshake that created them already proved reachability).
+		close(c.establishedCh)
 	}
 
 	c.sock.GetNearAddress(&c.localAddr)
@@ -117,10 +150,18 @@ func newConnection(sock *unet.Socket, fd int, remote unet.Address, connID uint64
 	return c
 }
 
-// start begins the read loop.
+// start begins the read loop and the background retransmit/keepalive loops.
 func (c *Connection) start() {
 	c.doneWg.Add(1)
 	go c.readLoop()
+
+	c.doneWg.Add(1)
+	go c.retransmitLoop()
+
+	if c.cfg.keepAlive > 0 {
+		c.doneWg.Add(1)
+		go c.keepAliveLoop()
+	}
 }
 
 // ConnID returns the connection identifier agreed during handshake.
@@ -175,7 +216,12 @@ func (c *Connection) Close() error {
 		return nil
 	}
 
-	// Send GOAWAY to peer (best-effort).
+	if c.onClose != nil {
+		c.onClose()
+	}
+
+	// Send GOAWAY to peer (best-effort). The socket is still open at this
+	// point (Shutdown happens below), so this reaches flushSendLocked fine.
 	c.sendControlFrame(frameGoAway, 0, 0)
 
 	close(c.closeCh)
@@ -201,35 +247,47 @@ func (c *Connection) Close() error {
 
 // --- send path (batched via sendmmsg) ---
 
-// sendDataFrame queues and sends a DATA frame.
+// sendDataFrame queues a DATA frame and records it for retransmission until
+// acknowledged. It does not flush; callers that want the frame on the wire
+// immediately (or after queuing several) must call flushSend().
 func (c *Connection) sendDataFrame(streamID, seq uint32, payload []byte) error {
 	buf, idx, err := c.acquireSendSlot()
 	if err != nil {
 		return err
 	}
 	n := encodeFrame(buf, frameData, streamID, seq, payload)
-	return c.commitSendSlot(idx, n)
+	if err := c.commitSendSlot(idx, n); err != nil {
+		return err
+	}
+	c.retransmit.add(streamID, seq, payload)
+	return nil
 }
 
-// sendControlFrame sends a control frame (no payload).
+// sendControlFrame sends a control frame (no payload) immediately.
 func (c *Connection) sendControlFrame(ftype uint8, streamID, seq uint32) error {
 	buf, idx, err := c.acquireSendSlot()
 	if err != nil {
 		return err
 	}
 	encodeHeader(buf, ftype, streamID, seq, 0)
-	return c.commitSendSlot(idx, frameHeaderSize)
+	if err := c.commitSendSlot(idx, frameHeaderSize); err != nil {
+		return err
+	}
+	return c.flushSend()
 }
 
-// sendACKFrame sends an ACK frame acknowledging receipt of a set of data frames.
-// Seqs must already be sized appropriately for the frame payload.
+// sendACKFrame sends an ACK frame acknowledging receipt of a set of data
+// frames immediately. len(seqs) must not exceed maxAckSeqsPerFrame.
 func (c *Connection) sendACKFrame(streamID uint32, seqs []uint32) error {
 	buf, idx, err := c.acquireSendSlot()
 	if err != nil {
 		return err
 	}
 	n := encodeAckFrame(buf, streamID, seqs)
-	return c.commitSendSlot(idx, n)
+	if err := c.commitSendSlot(idx, n); err != nil {
+		return err
+	}
+	return c.flushSend()
 }
 
 // acquireSendSlot reserves a slot in the send batch. If the batch is full,
@@ -248,7 +306,9 @@ func (c *Connection) acquireSendSlot() (buf []byte, idx int, err error) {
 	return buf, idx, nil
 }
 
-// commitSendSlot finishes writing to a send slot and flushes if batch is full.
+// commitSendSlot finishes writing to a send slot, flushing only if the
+// batch is now full. Caller holds sendMu (acquired by acquireSendSlot) and
+// this releases it.
 func (c *Connection) commitSendSlot(idx int, n int) error {
 	// Update the iov length for this message.
 	c.sendEP.Iov[idx].Len = uint64(n)
@@ -256,13 +316,18 @@ func (c *Connection) commitSendSlot(idx int, n int) error {
 	c.sendLens[idx] = n
 	c.sendN = idx + 1
 
+	var err error
 	if c.sendN >= c.cfg.batchSize {
-		err := c.flushSendLocked()
-		c.sendMu.Unlock()
-		return err
+		err = c.flushSendLocked()
 	}
-	// For low-latency, flush immediately for now. A future optimization
-	// could batch sends with a short timer.
+	c.sendMu.Unlock()
+	return err
+}
+
+// flushSend pushes any queued-but-unflushed datagrams to the wire in a
+// single sendmmsg call.
+func (c *Connection) flushSend() error {
+	c.sendMu.Lock()
 	err := c.flushSendLocked()
 	c.sendMu.Unlock()
 	return err
@@ -273,7 +338,7 @@ func (c *Connection) flushSendLocked() error {
 	if c.sendN == 0 {
 		return nil
 	}
-	if c.closed.Load() {
+	if c.sock.IsShutdown() {
 		c.sendN = 0
 		return ErrClosed
 	}
@@ -292,6 +357,76 @@ func (c *Connection) flushSendLocked() error {
 		return errno
 	}
 	return nil
+}
+
+// --- background loops ---
+
+// retransmitLoop periodically resends any DATA frame that has been
+// outstanding for longer than the configured (fixed, non-backing-off)
+// retransmit timeout. Streams that exceed the retry budget are failed.
+func (c *Connection) retransmitLoop() {
+	defer c.doneWg.Done()
+
+	const scanInterval = 20 * time.Millisecond
+	ticker := time.NewTicker(scanInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.closeCh:
+			return
+		case <-ticker.C:
+		}
+
+		resend, exceeded := c.retransmit.due(c.cfg.retransmitTmout, c.cfg.retransmitRetries)
+
+		for _, e := range resend {
+			buf, idx, err := c.acquireSendSlot()
+			if err != nil {
+				break // connection is going away
+			}
+			n := encodeFrame(buf, frameData, e.streamID, e.seq, e.data)
+			c.commitSendSlot(idx, n)
+		}
+		if len(resend) > 0 {
+			c.flushSend()
+		}
+
+		for _, e := range exceeded {
+			c.streamMu.RLock()
+			s, ok := c.streams[e.streamID]
+			c.streamMu.RUnlock()
+			if ok {
+				s.deliverError(ErrRetransmitExceeded)
+				c.removeStream(e.streamID)
+			}
+		}
+	}
+}
+
+// keepAliveLoop sends periodic pings and closes the connection if the peer
+// stops responding, so a vanished peer's connection state (and the
+// Listener's tracking entry) doesn't leak forever.
+func (c *Connection) keepAliveLoop() {
+	defer c.doneWg.Done()
+
+	const maxMissedPongs = 3
+	ticker := time.NewTicker(c.cfg.keepAlive)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.closeCh:
+			return
+		case <-ticker.C:
+		}
+
+		if atomic.AddInt32(&c.missedPongs, 1) > maxMissedPongs {
+			go c.Close()
+			return
+		}
+		c.SendPing(0, 0)
+	}
 }
 
 // --- receive path (batched via recvmmsg) ---
@@ -334,15 +469,21 @@ func (c *Connection) readLoop() {
 			}
 			c.handleDatagram(c.recvBufs[i][:nbytes])
 		}
+
+		c.flushPendingAcks()
 	}
 }
 
-// handleDatagram processes a single received datagram.
+// handleDatagram processes a single received datagram. Safe to call from
+// any goroutine (see recvMu).
 func (c *Connection) handleDatagram(buf []byte) {
 	f, err := decodeFrame(buf)
 	if err != nil {
 		return // discard malformed frames
 	}
+
+	c.recvMu.Lock()
+	defer c.recvMu.Unlock()
 
 	switch f.ftype {
 	case frameData:
@@ -354,15 +495,45 @@ func (c *Connection) handleDatagram(buf []byte) {
 	case frameStreamFIN:
 		c.handleStreamFIN(f)
 	case framePing:
-		c.sendControlFrame(framePong, 0, f.seq)
+		c.sendControlFrame(framePong, f.streamID, f.seq)
 	case framePong:
-		// could track RTT here
+		atomic.StoreInt32(&c.missedPongs, 0)
+		if sentAt := c.sendPingMs.Load(); sentAt > 0 {
+			c.rttMs.Store(time.Now().UnixMilli() - sentAt)
+			c.sendPingMs.Store(0)
+		}
 	case frameGoAway:
 		go c.Close()
 	case frameACK:
 		c.handleACK(f)
+	case frameHandshake:
+		c.handleHandshake(f)
 	default:
 		// unknown frame type, ignore
+	}
+}
+
+// flushPendingAcks sends any accumulated ACKs, chunked to fit the wire
+// format, then clears the pending list. Called after each receive batch.
+func (c *Connection) flushPendingAcks() {
+	c.recvMu.Lock()
+	if len(c.sReadIdsToAck) == 0 {
+		c.recvMu.Unlock()
+		return
+	}
+	pending := c.sReadIdsToAck
+	c.sReadIdsToAck = make(map[uint32][]uint32)
+	c.recvMu.Unlock()
+
+	for streamID, seqs := range pending {
+		for len(seqs) > 0 {
+			n := len(seqs)
+			if n > maxAckSeqsPerFrame {
+				n = maxAckSeqsPerFrame
+			}
+			c.sendACKFrame(streamID, seqs[:n])
+			seqs = seqs[n:]
+		}
 	}
 }
 
@@ -375,22 +546,25 @@ func (c *Connection) handleData(f frame) {
 		return // stream not found, discard
 	}
 
+	// ACK every valid frame for a known stream, even duplicates: if our
+	// previous ACK for this seq was lost, the sender will have retransmitted
+	// it, and it must be re-ACKed or the sender retransmits forever.
+	if c.sReadIdsToAck[f.streamID] == nil {
+		c.sReadIdsToAck[f.streamID] = make([]uint32, 0)
+	}
+	c.sReadIdsToAck[f.streamID] = append(c.sReadIdsToAck[f.streamID], f.seq)
+
 	if s.readSeq > f.seq {
-		return // Frame already processed, discard
+		return // already delivered, discard payload but keep the ACK above
 	}
 
 	if c.sReadReorderCount[f.streamID] > c.sReadReorderMax {
 		// close the stream for excessive out-of-order buffering
+		c.purgeStreamState(f.streamID)
 		s.deliverClose()
 		c.removeStream(f.streamID)
 		return
 	}
-
-	if c.sReadIdsToAck[f.streamID] == nil {
-		c.sReadIdsToAck[f.streamID] = make([]uint32, 0)
-	}
-
-	c.sReadIdsToAck[f.streamID] = append(c.sReadIdsToAck[f.streamID], f.seq)
 
 	if s.readSeq < f.seq {
 		// Out-of-order frame, buffer for later
@@ -451,6 +625,8 @@ func (c *Connection) handleStreamClose(f frame) {
 	}
 	c.streamMu.Unlock()
 
+	c.purgeStreamState(f.streamID)
+
 	if ok {
 		s.deliverClose()
 	}
@@ -466,14 +642,49 @@ func (c *Connection) handleStreamFIN(f frame) {
 	}
 }
 
+// handleHandshake processes a handshake-ack frame arriving on an already
+// constructed Connection. The initial handshake (which creates the
+// Connection in the first place) is parsed by Listener.readLoop directly.
+//
+// On the client, this is the peer's ack: mark the connection established.
+// On the server, this is a retried handshake from a client that never saw
+// our first ack (lost in transit) — just re-send the ack. This is the whole
+// retry mechanism for the handshake: fixed-interval resend by the client,
+// idempotent echo by the server, no timers on the server side at all.
+func (c *Connection) handleHandshake(f frame) {
+	if c.closed.Load() {
+		return
+	}
+	if c.isClient {
+		c.establishedOnce.Do(func() { close(c.establishedCh) })
+		return
+	}
+	c.sendControlFrame(frameHandshake, 0, 0)
+}
+
 func (c *Connection) handleACK(f frame) {
-	// TODO: retransmission stub — remove acked frames from retransmit queue
+	seqs, err := decodeAckFrame(f)
+	if err != nil {
+		return // discard malformed ACK
+	}
+	c.retransmit.ackMany(f.streamID, seqs)
+}
+
+// purgeStreamState removes all connection-level bookkeeping for a stream
+// (reorder buffer, pending acks, retransmit queue entries). Caller must
+// already hold recvMu (i.e. be called from within handleDatagram's dispatch).
+func (c *Connection) purgeStreamState(streamID uint32) {
+	delete(c.sReadReorderBuff, streamID)
+	delete(c.sReadReorderCount, streamID)
+	delete(c.sReadIdsToAck, streamID)
+	c.retransmit.purgeStream(streamID)
 }
 
 func (c *Connection) removeStream(id uint32) {
 	c.streamMu.Lock()
 	delete(c.streams, id)
 	c.streamMu.Unlock()
+	c.retransmit.purgeStream(id)
 }
 
 // --- Dial (client entry point) ---
@@ -521,18 +732,35 @@ func Dial(ctx context.Context, addr string, opts ...Option) (*Connection, error)
 	c := newConnection(sock, fd, remote, connID, true, cfg)
 	c.start()
 
-	// Send handshake.
 	if err := c.sendHandshake(connID); err != nil {
 		c.Close()
 		return nil, err
 	}
 
-	// Wait for handshake response.
-	// The read loop will receive the handshake ACK. For now, we consider
-	// the connection established once the handshake is sent.
-	// TODO: wait for handshake ACK with timeout
+	// Wait for the handshake ack, resending at a fixed interval (no
+	// backoff) until it arrives or the overall handshake timeout elapses.
+	deadline := time.NewTimer(cfg.handshakeTimout)
+	defer deadline.Stop()
+	retry := time.NewTicker(defaultHandshakeRetryIvl)
+	defer retry.Stop()
 
-	return c, nil
+	for {
+		select {
+		case <-c.establishedCh:
+			return c, nil
+		case <-ctx.Done():
+			c.Close()
+			return nil, ctx.Err()
+		case <-deadline.C:
+			c.Close()
+			return nil, ErrHandshakeTimeout
+		case <-retry.C:
+			if err := c.sendHandshake(connID); err != nil {
+				c.Close()
+				return nil, err
+			}
+		}
+	}
 }
 
 func (c *Connection) sendHandshake(connID uint64) error {
@@ -542,7 +770,10 @@ func (c *Connection) sendHandshake(connID uint64) error {
 		return err
 	}
 	n := encodeFrame(buf, frameHandshake, 0, 0, payload)
-	return c.commitSendSlot(idx, n)
+	if err := c.commitSendSlot(idx, n); err != nil {
+		return err
+	}
+	return c.flushSend()
 }
 
 func generateConnID() uint64 {
@@ -563,6 +794,20 @@ func parseAddr(addr string) (host string, port int, err error) {
 	}
 	port = pn
 	return
+}
+
+// Returns negative RTT if no ping-pong exchange has completed yet.
+func (c *Connection) GetRtt() int64 {
+	return c.rttMs.Load()
+}
+
+func (c *Connection) SendPing(streamId uint32, seq uint32) error {
+	c.sendPingMs.Store(time.Now().UnixMilli())
+	err := c.sendControlFrame(framePing, streamId, seq)
+	if err != nil {
+		c.sendPingMs.Store(0)
+	}
+	return err
 }
 
 // sendRaw sends a raw datagram directly via the socket fd. Used during

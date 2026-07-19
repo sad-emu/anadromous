@@ -93,7 +93,9 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 		return 0, errDeadlineExceeded
 	}
 
-	// Split into maxPayloadSize chunks and send each as a DATA frame.
+	// Split into maxPayloadSize chunks and queue each as a DATA frame. The
+	// batch is only flushed once at the end so a multi-datagram Write costs
+	// a single sendmmsg syscall instead of one per datagram.
 	for len(p) > 0 {
 		chunk := p
 		if len(chunk) > maxPayloadSize {
@@ -104,10 +106,14 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 
 		err = s.conn.sendDataFrame(s.id, seq, chunk)
 		if err != nil {
+			s.conn.flushSend()
 			return n, err
 		}
 		n += len(chunk)
 		p = p[len(chunk):]
+	}
+	if ferr := s.conn.flushSend(); ferr != nil {
+		return n, ferr
 	}
 	return n, nil
 }
@@ -199,6 +205,23 @@ func (s *Stream) deliverFIN() {
 		s.readErr = io.EOF
 	}
 	s.readCond.Broadcast()
+}
+
+// deliverError fails the stream with a sticky error on both the read and
+// write sides, e.g. when retransmission has been exhausted for this stream.
+func (s *Stream) deliverError(err error) {
+	s.readMu.Lock()
+	if s.readErr == nil {
+		s.readErr = err
+	}
+	s.closed = true
+	s.readCond.Broadcast()
+	s.readMu.Unlock()
+
+	s.writeMu.Lock()
+	s.writeFIN = true
+	s.writeCond.Broadcast()
+	s.writeMu.Unlock()
 }
 
 // deliverClose is called when the remote closes the stream entirely.

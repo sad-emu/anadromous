@@ -113,12 +113,16 @@ func (l *Listener) Close() error {
 	l.doneWg.Wait()
 	l.sock.Close()
 
+	// Snapshot and release the lock before closing: Connection.Close invokes
+	// onClose -> removeConnection, which takes connMu itself.
 	l.connMu.Lock()
-	for _, c := range l.conns {
-		c.Close()
-	}
+	conns := l.conns
 	l.conns = nil
 	l.connMu.Unlock()
+
+	for _, c := range conns {
+		c.Close()
+	}
 
 	return nil
 }
@@ -159,8 +163,11 @@ func (l *Listener) readLoop() {
 		l.connMu.RUnlock()
 
 		if found {
-			// Forward to existing connection's read path.
+			// Forward to existing connection's read path. This is a rare
+			// fallback (SO_REUSEPORT normally routes exact-match connected
+			// sockets directly), so flushing acks per-datagram here is fine.
 			existing.handleDatagram(buf[:n])
+			existing.flushPendingAcks()
 			continue
 		}
 
@@ -229,6 +236,7 @@ func (l *Listener) createConnection(
 	}
 
 	c := newConnection(sock, fd, remoteAddr, connID, false, l.cfg)
+	c.onClose = func() { l.removeConnection(remoteAddr.String()) }
 	c.start()
 	return c, nil
 }
