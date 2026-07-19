@@ -53,7 +53,8 @@ func Listen(addr string, opts ...Option) (*Listener, error) {
 		SetOptReusePort().
 		SetOptReuseAddr().
 		SetOptRcvBuf(cfg.recvBufSize).
-		SetOptSndBuf(cfg.sendBufSize)
+		SetOptSndBuf(cfg.sendBufSize).
+		SetOpt(bindToDevice(cfg.bindDevice), cfg.bindDevice == "")
 
 	if cfg.socketOpts != nil {
 		cfg.socketOpts(sock)
@@ -133,7 +134,7 @@ func (l *Listener) Close() error {
 func (l *Listener) readLoop() {
 	defer l.doneWg.Done()
 
-	buf := make([]byte, maxDatagramSize)
+	buf := make([]byte, l.cfg.maxDatagram())
 
 	for {
 		if l.closed.Load() {
@@ -217,7 +218,8 @@ func (l *Listener) createConnection(
 		SetOptReusePort().
 		SetOptReuseAddr().
 		SetOptRcvBuf(l.cfg.recvBufSize).
-		SetOptSndBuf(l.cfg.sendBufSize)
+		SetOptSndBuf(l.cfg.sendBufSize).
+		SetOpt(bindToDevice(l.cfg.bindDevice), l.cfg.bindDevice == "")
 
 	if l.cfg.socketOpts != nil {
 		l.cfg.socketOpts(sock)

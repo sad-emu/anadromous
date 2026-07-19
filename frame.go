@@ -20,22 +20,28 @@ const (
 	frameGoAway       uint8 = 0x08 // Connection shutting down
 	frameACK          uint8 = 0x09 // Acknowledge received data
 	frameHandshake    uint8 = 0x0A // Connection handshake
+	frameStreamReset  uint8 = 0x0B // Abort the sender's write side (like QUIC RESET_STREAM)
+	frameStopSending  uint8 = 0x0C // Ask the peer to stop sending (like QUIC STOP_SENDING)
 )
 
 // frameHeaderSize is the fixed size of a frame header on the wire.
 // Layout: [Type(1) | StreamID(4) | Sequence(4) | Length(4)] = 13 bytes
 const frameHeaderSize = 13
 
-// maxPayloadSize is the maximum payload per UDP datagram.
-// Conservative default: 1200 bytes to fit within common MTUs without fragmentation.
-const maxPayloadSize = 1200
+// defaultMaxPayloadSize is the default maximum payload per UDP datagram.
+// Conservative: 1200 bytes to fit within common MTUs without fragmentation.
+// Configurable per connection via WithMaxDatagramSize.
+const defaultMaxPayloadSize = 1200
 
-// maxDatagramSize is the max full datagram size (header + payload).
-const maxDatagramSize = frameHeaderSize + maxPayloadSize
+// defaultMaxDatagramSize is the default full datagram size (header + payload).
+const defaultMaxDatagramSize = frameHeaderSize + defaultMaxPayloadSize
 
-// maxAckSeqsPerFrame is the maximum number of sequence numbers that fit in
-// a single ACK frame's payload: [Count(4) | Seq(4) x N] <= maxPayloadSize.
-const maxAckSeqsPerFrame = (maxPayloadSize - 4) / 4
+// maxAckSeqsPerFrame returns the maximum number of sequence numbers that fit
+// in a single ACK frame's payload for a given max payload size:
+// [Count(4) | Seq(4) x N] <= maxPayload.
+func maxAckSeqsPerFrame(maxPayload int) int {
+	return (maxPayload - 4) / 4
+}
 
 // frame represents a decoded frame header plus its payload.
 type frame struct {
@@ -128,6 +134,23 @@ func decodeFrame(buf []byte) (f frame, err error) {
 		f.payload = buf[frameHeaderSize:total]
 	}
 	return
+}
+
+// resetPayload encodes a RESET_STREAM frame payload carrying the application
+// error code.
+func resetPayload(code uint64) []byte {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, code)
+	return b
+}
+
+// decodeResetPayload extracts the application error code from a RESET_STREAM
+// payload. A missing/short payload decodes as code 0.
+func decodeResetPayload(payload []byte) uint64 {
+	if len(payload) < 8 {
+		return 0
+	}
+	return binary.BigEndian.Uint64(payload)
 }
 
 // handshakePayload encodes a handshake frame payload containing the connection ID.

@@ -9,7 +9,7 @@ import (
 
 func TestRetransmitQueueAddDue(t *testing.T) {
 	q := newRetransmitQueue()
-	q.add(1, 0, []byte("hello"))
+	q.add(frameData, 1, 0, []byte("hello"))
 
 	resend, exceeded := q.due(10*time.Millisecond, 5)
 	if len(resend) != 0 || len(exceeded) != 0 {
@@ -31,9 +31,9 @@ func TestRetransmitQueueAddDue(t *testing.T) {
 
 func TestRetransmitQueueAckRemoves(t *testing.T) {
 	q := newRetransmitQueue()
-	q.add(1, 0, []byte("a"))
-	q.add(1, 1, []byte("b"))
-	q.add(2, 0, []byte("c"))
+	q.add(frameData, 1, 0, []byte("a"))
+	q.add(frameData, 1, 1, []byte("b"))
+	q.add(frameData, 2, 0, []byte("c"))
 
 	q.ackMany(1, []uint32{0, 1})
 
@@ -46,8 +46,8 @@ func TestRetransmitQueueAckRemoves(t *testing.T) {
 
 func TestRetransmitQueuePurgeStream(t *testing.T) {
 	q := newRetransmitQueue()
-	q.add(1, 0, []byte("a"))
-	q.add(2, 0, []byte("b"))
+	q.add(frameData, 1, 0, []byte("a"))
+	q.add(frameData, 2, 0, []byte("b"))
 
 	q.purgeStream(1)
 
@@ -60,7 +60,7 @@ func TestRetransmitQueuePurgeStream(t *testing.T) {
 
 func TestRetransmitQueueExceededRetries(t *testing.T) {
 	q := newRetransmitQueue()
-	q.add(1, 0, []byte("a"))
+	q.add(frameData, 1, 0, []byte("a"))
 
 	// First scan: retries goes 0 -> 1, still under maxRetries=1... use 0 to
 	// force immediate exceed on first due scan.
@@ -81,7 +81,7 @@ func TestRetransmitQueueExceededRetries(t *testing.T) {
 }
 
 func TestAckFrameRoundTrip(t *testing.T) {
-	buf := make([]byte, maxDatagramSize)
+	buf := make([]byte, defaultMaxDatagramSize)
 	seqs := []uint32{1, 2, 5, 9, 100}
 
 	n := encodeAckFrame(buf, 42, seqs)

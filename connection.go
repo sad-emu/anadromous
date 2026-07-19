@@ -44,14 +44,20 @@ type Connection struct {
 	sendN    int      // number of pending datagrams in current batch
 
 	// stream management
-	streamMu          sync.RWMutex
-	streams           map[uint32]*Stream
-	nextStream        uint32 // next stream ID to allocate
-	acceptCh          chan *Stream
-	sReadReorderBuff  map[uint32]map[uint32][]byte // out-of-order data waiting for missing sequence numbers
-	sReadReorderCount map[uint32]int               // total buffered out-of-order bytes
-	sReadReorderMax   int                          // max count of out-of-order packets per stream
-	sReadIdsToAck     map[uint32][]uint32          // List of packet IDs to ACK for each stream
+	streamMu      sync.RWMutex
+	streams       map[uint32]*Stream
+	nextStream    uint32 // next stream ID to allocate
+	acceptCh      chan *Stream
+	sReadIdsToAck map[uint32][]uint32 // packet IDs to ACK per stream (recvMu)
+
+	// deadStreams are tombstones for recently removed streams (recvMu).
+	// Late retransmits for them are ACKed and discarded instead of
+	// resurrecting the stream. Entries expire after tombstoneTTL.
+	deadStreams map[uint32]time.Time
+
+	// streamFreedCh is signaled when a stream slot frees up, waking
+	// OpenStreamSync waiters.
+	streamFreedCh chan struct{}
 
 	// recvMu serializes datagram processing. Normally only readLoop calls
 	// handleDatagram, but Listener.readLoop's fallback path can also forward
@@ -83,6 +89,9 @@ type Connection struct {
 	rttMs       atomic.Int64
 	missedPongs int32
 
+	// statResends counts frames retransmitted over the connection lifetime.
+	statResends atomic.Int64
+
 	// role: true if this side initiated the connection (client)
 	isClient bool
 }
@@ -91,19 +100,19 @@ type Connection struct {
 // The socket must be a UDP socket with NearAddr and FarAddr set.
 func newConnection(sock *unet.Socket, fd int, remote unet.Address, connID uint64, isClient bool, cfg config) *Connection {
 	c := &Connection{
-		cfg:              cfg,
-		connID:           connID,
-		sock:             sock,
-		fd:               fd,
-		remoteAddr:       remote,
-		streams:          make(map[uint32]*Stream, 64),
-		acceptCh:         make(chan *Stream, cfg.maxStreams),
-		closeCh:          make(chan struct{}),
-		isClient:         isClient,
-		sReadReorderBuff: make(map[uint32]map[uint32][]byte),
-		sReadReorderMax:  10000,
-		retransmit:       newRetransmitQueue(),
-		establishedCh:    make(chan struct{}),
+		cfg:           cfg,
+		connID:        connID,
+		sock:          sock,
+		fd:            fd,
+		remoteAddr:    remote,
+		streams:       make(map[uint32]*Stream, 64),
+		acceptCh:      make(chan *Stream, cfg.maxStreams),
+		closeCh:       make(chan struct{}),
+		isClient:      isClient,
+		retransmit:    newRetransmitQueue(),
+		establishedCh: make(chan struct{}),
+		deadStreams:   make(map[uint32]time.Time),
+		streamFreedCh: make(chan struct{}, 1),
 	}
 	c.rttMs.Store(-1)
 
@@ -122,16 +131,17 @@ func newConnection(sock *unet.Socket, fd int, remote unet.Address, connID uint64
 
 	c.sock.GetNearAddress(&c.localAddr)
 
+	maxDatagram := cfg.maxDatagram()
+
 	// Set up batched receive endpoint.
-	c.sReadReorderCount = make(map[uint32]int)
 	c.sReadIdsToAck = make(map[uint32][]uint32)
 	c.recvBufs = make([][]byte, cfg.batchSize)
 	recvIdx := 0
 	c.recvEP.SetupVectors(cfg.batchSize, 1, func(iov []syscall.Iovec) {
-		b := make([]byte, maxDatagramSize)
+		b := make([]byte, maxDatagram)
 		c.recvBufs[recvIdx] = b
 		iov[0].Base = &b[0]
-		iov[0].Len = uint64(maxDatagramSize)
+		iov[0].Len = uint64(maxDatagram)
 		recvIdx++
 	}, nil) // connected socket, no name needed
 
@@ -140,7 +150,7 @@ func newConnection(sock *unet.Socket, fd int, remote unet.Address, connID uint64
 	c.sendLens = make([]int, cfg.batchSize)
 	sendIdx := 0
 	c.sendEP.SetupVectors(cfg.batchSize, 1, func(iov []syscall.Iovec) {
-		b := make([]byte, maxDatagramSize)
+		b := make([]byte, maxDatagram)
 		c.sendBufs[sendIdx] = b
 		iov[0].Base = &b[0]
 		iov[0].Len = 0 // set to actual frame size on each send
@@ -173,7 +183,10 @@ func (c *Connection) LocalAddr() net.Addr { return &c.localAddr }
 // RemoteAddr returns the remote network address.
 func (c *Connection) RemoteAddr() net.Addr { return &c.remoteAddr }
 
-// OpenStream creates a new outbound stream.
+// OpenStream creates a new outbound stream. Stream opens are implicit: the
+// peer learns of the stream when its first frame arrives, so nothing is sent
+// on the wire here and opens cannot be lost. Returns ErrMaxStreams when at
+// the concurrent stream limit (see OpenStreamSync to wait instead).
 func (c *Connection) OpenStream(ctx context.Context) (*Stream, error) {
 	if c.closed.Load() {
 		return nil, ErrClosed
@@ -190,12 +203,25 @@ func (c *Connection) OpenStream(ctx context.Context) (*Stream, error) {
 	c.streams[id] = s
 	c.streamMu.Unlock()
 
-	// Tell the peer about the new stream.
-	if err := c.sendControlFrame(frameStreamOpen, id, 0); err != nil {
-		c.removeStream(id)
-		return nil, err
-	}
 	return s, nil
+}
+
+// OpenStreamSync creates a new outbound stream, blocking until a stream slot
+// is available, the context is done, or the connection closes.
+func (c *Connection) OpenStreamSync(ctx context.Context) (*Stream, error) {
+	for {
+		s, err := c.OpenStream(ctx)
+		if err != ErrMaxStreams {
+			return s, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-c.closeCh:
+			return nil, ErrClosed
+		case <-c.streamFreedCh:
+		}
+	}
 }
 
 // AcceptStream waits for the remote side to open a stream.
@@ -208,6 +234,13 @@ func (c *Connection) AcceptStream(ctx context.Context) (*Stream, error) {
 	case s := <-c.acceptCh:
 		return s, nil
 	}
+}
+
+// CloseWithError closes the connection and all streams. The error code and
+// reason are accepted for quic-go API compatibility; they are not currently
+// transmitted to the peer.
+func (c *Connection) CloseWithError(code uint64, reason string) error {
+	return c.Close()
 }
 
 // Close closes the connection and all streams.
@@ -259,8 +292,30 @@ func (c *Connection) sendDataFrame(streamID, seq uint32, payload []byte) error {
 	if err := c.commitSendSlot(idx, n); err != nil {
 		return err
 	}
-	c.retransmit.add(streamID, seq, payload)
+	c.retransmit.add(frameData, streamID, seq, payload)
 	return nil
+}
+
+// sendReliableFrame sends a frame immediately and retransmits it until the
+// peer acknowledges its (streamID, seq). Used for FIN and RESET frames,
+// which occupy the sequence position after the stream's last data frame.
+func (c *Connection) sendReliableFrame(ftype uint8, streamID, seq uint32, payload []byte) error {
+	buf, idx, err := c.acquireSendSlot()
+	if err != nil {
+		return err
+	}
+	n := encodeFrame(buf, ftype, streamID, seq, payload)
+	if err := c.commitSendSlot(idx, n); err != nil {
+		return err
+	}
+	c.retransmit.add(ftype, streamID, seq, payload)
+	return c.flushSend()
+}
+
+// sendWindowUpdate grants the peer additional flow-control credit for a
+// stream. The credit rides in the header's seq field; there is no payload.
+func (c *Connection) sendWindowUpdate(streamID uint32, credit uint32) error {
+	return c.sendControlFrame(frameWindowUpdate, streamID, credit)
 }
 
 // sendControlFrame sends a control frame (no payload) immediately.
@@ -349,7 +404,7 @@ func (c *Connection) flushSendLocked() error {
 
 	// Reset iov lens for next batch.
 	for i := 0; i < n; i++ {
-		c.sendEP.Iov[i].Len = uint64(maxDatagramSize)
+		c.sendEP.Iov[i].Len = uint64(c.cfg.maxDatagram())
 		c.sendEP.Hdrs[i].NTransferred = 0
 	}
 
@@ -361,9 +416,10 @@ func (c *Connection) flushSendLocked() error {
 
 // --- background loops ---
 
-// retransmitLoop periodically resends any DATA frame that has been
-// outstanding for longer than the configured (fixed, non-backing-off)
-// retransmit timeout. Streams that exceed the retry budget are failed.
+// retransmitLoop periodically resends any reliable frame (DATA, FIN, RESET)
+// that has been outstanding for longer than the configured (fixed,
+// non-backing-off) retransmit timeout, fails streams that exceed the retry
+// budget, garbage-collects finished streams, and expires tombstones.
 func (c *Connection) retransmitLoop() {
 	defer c.doneWg.Done()
 
@@ -385,10 +441,11 @@ func (c *Connection) retransmitLoop() {
 			if err != nil {
 				break // connection is going away
 			}
-			n := encodeFrame(buf, frameData, e.streamID, e.seq, e.data)
+			n := encodeFrame(buf, e.ftype, e.streamID, e.seq, e.data)
 			c.commitSendSlot(idx, n)
 		}
 		if len(resend) > 0 {
+			c.statResends.Add(int64(len(resend)))
 			c.flushSend()
 		}
 
@@ -401,7 +458,35 @@ func (c *Connection) retransmitLoop() {
 				c.removeStream(e.streamID)
 			}
 		}
+
+		c.gcStreams()
 	}
+}
+
+// gcStreams removes streams whose both directions have finished and whose
+// outgoing frames are all acknowledged, and expires old tombstones.
+func (c *Connection) gcStreams() {
+	var done []uint32
+	c.streamMu.RLock()
+	for id, s := range c.streams {
+		if s.finished() && !c.retransmit.hasStream(id) {
+			done = append(done, id)
+		}
+	}
+	c.streamMu.RUnlock()
+
+	for _, id := range done {
+		c.removeStream(id)
+	}
+
+	c.recvMu.Lock()
+	now := time.Now()
+	for id, t := range c.deadStreams {
+		if now.Sub(t) > tombstoneTTL {
+			delete(c.deadStreams, id)
+		}
+	}
+	c.recvMu.Unlock()
 }
 
 // keepAliveLoop sends periodic pings and closes the connection if the peer
@@ -442,7 +527,7 @@ func (c *Connection) readLoop() {
 		// Reset iov lens for receive.
 		for i := 0; i < c.cfg.batchSize; i++ {
 			c.recvEP.Iov[i].Base = &c.recvBufs[i][0]
-			c.recvEP.Iov[i].Len = uint64(maxDatagramSize)
+			c.recvEP.Iov[i].Len = uint64(c.cfg.maxDatagram())
 			c.recvEP.Hdrs[i].NTransferred = 0
 		}
 
@@ -488,12 +573,14 @@ func (c *Connection) handleDatagram(buf []byte) {
 	switch f.ftype {
 	case frameData:
 		c.handleData(f)
-	case frameStreamOpen:
-		c.handleStreamOpen(f)
-	case frameStreamClose:
-		c.handleStreamClose(f)
 	case frameStreamFIN:
 		c.handleStreamFIN(f)
+	case frameStreamReset:
+		c.handleStreamReset(f)
+	case frameStopSending:
+		c.handleStopSending(f)
+	case frameWindowUpdate:
+		c.handleWindowUpdate(f)
 	case framePing:
 		c.sendControlFrame(framePong, f.streamID, f.seq)
 	case framePong:
@@ -509,7 +596,8 @@ func (c *Connection) handleDatagram(buf []byte) {
 	case frameHandshake:
 		c.handleHandshake(f)
 	default:
-		// unknown frame type, ignore
+		// unknown frame type (including the legacy explicit stream
+		// open/close types), ignore
 	}
 }
 
@@ -525,11 +613,12 @@ func (c *Connection) flushPendingAcks() {
 	c.sReadIdsToAck = make(map[uint32][]uint32)
 	c.recvMu.Unlock()
 
+	maxAcks := maxAckSeqsPerFrame(c.cfg.maxPayload)
 	for streamID, seqs := range pending {
 		for len(seqs) > 0 {
 			n := len(seqs)
-			if n > maxAckSeqsPerFrame {
-				n = maxAckSeqsPerFrame
+			if n > maxAcks {
+				n = maxAcks
 			}
 			c.sendACKFrame(streamID, seqs[:n])
 			seqs = seqs[n:]
@@ -537,108 +626,130 @@ func (c *Connection) flushPendingAcks() {
 	}
 }
 
-func (c *Connection) handleData(f frame) {
-	c.streamMu.RLock()
-	s, ok := c.streams[f.streamID]
-	c.streamMu.RUnlock()
-
-	if !ok {
-		return // stream not found, discard
-	}
-
-	// ACK every valid frame for a known stream, even duplicates: if our
-	// previous ACK for this seq was lost, the sender will have retransmitted
-	// it, and it must be re-ACKed or the sender retransmits forever.
-	if c.sReadIdsToAck[f.streamID] == nil {
-		c.sReadIdsToAck[f.streamID] = make([]uint32, 0)
-	}
-	c.sReadIdsToAck[f.streamID] = append(c.sReadIdsToAck[f.streamID], f.seq)
-
-	if s.readSeq > f.seq {
-		return // already delivered, discard payload but keep the ACK above
-	}
-
-	if c.sReadReorderCount[f.streamID] > c.sReadReorderMax {
-		// close the stream for excessive out-of-order buffering
-		c.purgeStreamState(f.streamID)
-		s.deliverClose()
-		c.removeStream(f.streamID)
-		return
-	}
-
-	if s.readSeq < f.seq {
-		// Out-of-order frame, buffer for later
-		if c.sReadReorderBuff[f.streamID] == nil {
-			c.sReadReorderBuff[f.streamID] = make(map[uint32][]byte)
-		}
-		c.sReadReorderBuff[f.streamID][f.seq] = f.payload
-		c.sReadReorderCount[f.streamID] = c.sReadReorderCount[f.streamID] + 1
-		return
-	}
-
-	s.readSeq++
-	s.deliverData(f.payload)
-
-	// Initial implementation for out of order recovery
-	if c.sReadReorderBuff[f.streamID] != nil {
-		totalReorders := c.sReadReorderCount[f.streamID]
-		for i := 0; i < totalReorders; i++ {
-			if c.sReadReorderBuff[f.streamID][s.readSeq] != nil {
-				s.deliverData(c.sReadReorderBuff[f.streamID][s.readSeq])
-				delete(c.sReadReorderBuff[f.streamID], s.readSeq)
-				s.readSeq++
-				c.sReadReorderCount[f.streamID] = c.sReadReorderCount[f.streamID] - 1
-			} else {
-				break
-			}
-		}
-	}
+// queueAck records a (stream, seq) for the next ACK flush. Caller holds recvMu.
+func (c *Connection) queueAck(streamID, seq uint32) {
+	c.sReadIdsToAck[streamID] = append(c.sReadIdsToAck[streamID], seq)
 }
 
-func (c *Connection) handleStreamOpen(f frame) {
-	c.streamMu.Lock()
-	if _, exists := c.streams[f.streamID]; exists {
-		c.streamMu.Unlock()
-		return // duplicate open, ignore
+// streamForFrame resolves the stream a DATA/FIN frame belongs to, creating
+// it when the frame is the first sign of a new peer-initiated stream
+// (stream opens are implicit). Caller holds recvMu.
+//
+// Returns (nil, true) when the frame should be ACKed and discarded (stream
+// recently finished, or a stale frame for one of our own old streams), and
+// (nil, false) when it should be dropped without an ACK.
+func (c *Connection) streamForFrame(streamID uint32) (s *Stream, ackDiscard bool) {
+	c.streamMu.RLock()
+	s, ok := c.streams[streamID]
+	c.streamMu.RUnlock()
+	if ok {
+		return s, false
 	}
+
+	if _, dead := c.deadStreams[streamID]; dead {
+		return nil, true // late retransmit for a finished stream
+	}
+
+	// Client-initiated streams are odd, server-initiated even. A frame for
+	// an unknown stream with OUR parity is stale (our stream is long gone,
+	// tombstone expired) — ACK it so the peer stops retransmitting.
+	peerInitiated := (streamID%2 == 1) != c.isClient
+	if !peerInitiated {
+		return nil, true
+	}
+
+	// First frame of a new peer-initiated stream: create and hand to Accept.
+	c.streamMu.Lock()
 	if len(c.streams) >= c.cfg.maxStreams {
 		c.streamMu.Unlock()
-		return // at capacity, ignore
+		// Refuse: reset both directions so the opener fails fast instead
+		// of retransmitting into the void.
+		c.sendControlFrame(frameStopSending, streamID, 0)
+		c.sendResetNoQueue(streamID, 0)
+		return nil, false
 	}
-	s := newStream(f.streamID, c, c.cfg.streamBufSize)
-	c.streams[f.streamID] = s
+	s = newStream(streamID, c, c.cfg.streamBufSize)
+	c.streams[streamID] = s
 	c.streamMu.Unlock()
 
-	// Non-blocking send to accept channel.
 	select {
 	case c.acceptCh <- s:
 	default:
-		// Accept channel full — stream will be available via map but not accepted.
+		// Accept channel full — stream exists but was not delivered.
+	}
+	return s, false
+}
+
+// sendResetNoQueue fires a RESET frame without retransmit tracking. Used to
+// refuse streams we have no local state for.
+func (c *Connection) sendResetNoQueue(streamID uint32, code uint64) {
+	buf, idx, err := c.acquireSendSlot()
+	if err != nil {
+		return
+	}
+	n := encodeFrame(buf, frameStreamReset, streamID, 0, resetPayload(code))
+	if c.commitSendSlot(idx, n) == nil {
+		c.flushSend()
 	}
 }
 
-func (c *Connection) handleStreamClose(f frame) {
-	c.streamMu.Lock()
-	s, ok := c.streams[f.streamID]
-	if ok {
-		delete(c.streams, f.streamID)
+func (c *Connection) handleData(f frame) {
+	s, ackDiscard := c.streamForFrame(f.streamID)
+	if s == nil {
+		if ackDiscard {
+			c.queueAck(f.streamID, f.seq)
+		}
+		return
 	}
-	c.streamMu.Unlock()
-
-	c.purgeStreamState(f.streamID)
-
-	if ok {
-		s.deliverClose()
+	if s.deliver(f.seq, f.payload, false) {
+		c.queueAck(f.streamID, f.seq)
 	}
 }
 
 func (c *Connection) handleStreamFIN(f frame) {
+	s, ackDiscard := c.streamForFrame(f.streamID)
+	if s == nil {
+		if ackDiscard {
+			c.queueAck(f.streamID, f.seq)
+		}
+		return
+	}
+	if s.deliver(f.seq, nil, true) {
+		c.queueAck(f.streamID, f.seq)
+	}
+}
+
+// handleStreamReset processes a peer's write-side abort. Resets are
+// retransmitted by the peer until ACKed, so always queue the ACK.
+func (c *Connection) handleStreamReset(f frame) {
+	c.queueAck(f.streamID, f.seq)
+
 	c.streamMu.RLock()
 	s, ok := c.streams[f.streamID]
 	c.streamMu.RUnlock()
-
 	if ok {
-		s.deliverFIN()
+		s.deliverReset(decodeResetPayload(f.payload))
+	}
+}
+
+// handleStopSending processes the peer's request that we stop sending on a
+// stream: cancel our write side and reset back.
+func (c *Connection) handleStopSending(f frame) {
+	c.streamMu.RLock()
+	s, ok := c.streams[f.streamID]
+	c.streamMu.RUnlock()
+	if ok {
+		s.onStopSending(uint64(f.seq))
+	}
+}
+
+// handleWindowUpdate credits a stream's send window.
+func (c *Connection) handleWindowUpdate(f frame) {
+	c.streamMu.RLock()
+	s, ok := c.streams[f.streamID]
+	c.streamMu.RUnlock()
+	if ok {
+		s.addSendCredit(f.seq)
 	}
 }
 
@@ -670,21 +781,41 @@ func (c *Connection) handleACK(f frame) {
 	c.retransmit.ackMany(f.streamID, seqs)
 }
 
-// purgeStreamState removes all connection-level bookkeeping for a stream
-// (reorder buffer, pending acks, retransmit queue entries). Caller must
-// already hold recvMu (i.e. be called from within handleDatagram's dispatch).
-func (c *Connection) purgeStreamState(streamID uint32) {
-	delete(c.sReadReorderBuff, streamID)
-	delete(c.sReadReorderCount, streamID)
-	delete(c.sReadIdsToAck, streamID)
-	c.retransmit.purgeStream(streamID)
-}
+// tombstoneTTL is how long a removed stream's ID keeps ACKing late
+// retransmits before the tombstone expires. Comfortably longer than the
+// worst-case retransmit horizon.
+const tombstoneTTL = 10 * time.Second
 
+// removeStream removes a stream from the connection, leaving a tombstone so
+// late retransmits are ACKed rather than resurrecting the stream, and wakes
+// any OpenStreamSync waiter.
 func (c *Connection) removeStream(id uint32) {
 	c.streamMu.Lock()
 	delete(c.streams, id)
 	c.streamMu.Unlock()
+
 	c.retransmit.purgeStream(id)
+
+	c.recvMu.Lock()
+	c.deadStreams[id] = time.Now()
+	c.recvMu.Unlock()
+
+	select {
+	case c.streamFreedCh <- struct{}{}:
+	default:
+	}
+}
+
+// bindToDevice returns a unet socket option that binds the socket to a
+// network interface via SO_BINDTODEVICE. Requires CAP_NET_RAW or root.
+func bindToDevice(ifname string) unet.SockOpt {
+	return func(s *unet.Socket) error {
+		fd, ok := s.Fd.Get()
+		if !ok {
+			return ErrClosed
+		}
+		return syscall.SetsockoptString(fd, syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, ifname)
+	}
 }
 
 // --- Dial (client entry point) ---
@@ -707,7 +838,8 @@ func Dial(ctx context.Context, addr string, opts ...Option) (*Connection, error)
 		ResolveNearAddr("0.0.0.0", 0).
 		ConstructUdp().
 		SetOptRcvBuf(cfg.recvBufSize).
-		SetOptSndBuf(cfg.sendBufSize)
+		SetOptSndBuf(cfg.sendBufSize).
+		SetOpt(bindToDevice(cfg.bindDevice), cfg.bindDevice == "")
 
 	if cfg.socketOpts != nil {
 		cfg.socketOpts(sock)

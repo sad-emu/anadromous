@@ -29,4 +29,8 @@ var (
 	// ErrRetransmitExceeded is returned when a frame could not be delivered
 	// after the configured number of fixed-interval retransmit attempts.
 	ErrRetransmitExceeded = errors.New("anadromous: retransmit attempts exceeded")
+
+	// ErrStreamReset is returned when a stream was aborted, either by the
+	// peer (RESET_STREAM / STOP_SENDING) or locally via CancelRead/CancelWrite.
+	ErrStreamReset = errors.New("anadromous: stream reset")
 )

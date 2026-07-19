@@ -56,52 +56,74 @@ func handleDataLocked(c *Connection, f frame) {
 	c.recvMu.Unlock()
 }
 
+// serverStream fetches a stream from the server connection under lock.
+func serverStream(t *testing.T, c *Connection, id uint32) *Stream {
+	t.Helper()
+	c.streamMu.RLock()
+	s := c.streams[id]
+	c.streamMu.RUnlock()
+	if s == nil {
+		t.Fatalf("stream %d not found on server", id)
+	}
+	return s
+}
+
 func TestConnectionInOrder(t *testing.T) {
 	_, server := newTestConnectionPair(t)
-	// send a few in-order packets and verify they are received correctly
-	fakeConnectionId := uint32(1)
-	server.streams = make(map[uint32]*Stream) // reset streams map for testing
-	server.streams[fakeConnectionId] = newStream(fakeConnectionId, server, 1024)
-	f1 := createTestFrame(uint32(fakeConnectionId), 1, 0, []byte("hello"))
-	f2 := createTestFrame(uint32(fakeConnectionId), 1, 1, []byte("world"))
-	f3 := createTestFrame(uint32(fakeConnectionId), 1, 2, []byte("!"))
+	// Inject in-order frames for a client-initiated stream; the first frame
+	// implicitly opens the stream on the server.
+	f1 := createTestFrame(1, 1, 0, []byte("hello"))
+	f2 := createTestFrame(1, 1, 1, []byte("world"))
+	f3 := createTestFrame(1, 1, 2, []byte("!"))
 	handleDataLocked(server, f1)
 	handleDataLocked(server, f2)
 	handleDataLocked(server, f3)
 
-	server.streams[fakeConnectionId].readMu.Lock()
-	if server.streams[fakeConnectionId].readSeq != 3 {
-		t.Fatalf("expected readSeq to be 3, got %d", server.streams[fakeConnectionId].readSeq)
+	s := serverStream(t, server, 1)
+	s.readMu.Lock()
+	seq := s.readSeq
+	s.readMu.Unlock()
+	if seq != 3 {
+		t.Fatalf("expected readSeq to be 3, got %d", seq)
 	}
-	if string(server.streams[fakeConnectionId].readBuf[:server.streams[fakeConnectionId].readLen]) != "helloworld!" {
-		t.Fatalf("expected readBuf to contain 'helloworld!', got %q", string(server.streams[fakeConnectionId].readBuf[:server.streams[fakeConnectionId].readLen]))
+
+	buf := make([]byte, 64)
+	n, err := s.Read(buf)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
 	}
-	server.streams[fakeConnectionId].readMu.Unlock()
+	if string(buf[:n]) != "helloworld!" {
+		t.Fatalf("expected 'helloworld!', got %q", string(buf[:n]))
+	}
 }
 
 func TestConnectionOutOfOrder(t *testing.T) {
 	_, server := newTestConnectionPair(t)
-	// send a few out-of-order packets and verify they are buffered and delivered in order
-	fakeConnectionId := uint32(1)
-	server.streams = make(map[uint32]*Stream) // reset streams map for testing
-	server.streams[fakeConnectionId] = newStream(fakeConnectionId, server, 1024)
-	f1 := createTestFrame(uint32(fakeConnectionId), 1, 0, []byte("hello"))
-	f2 := createTestFrame(uint32(fakeConnectionId), 1, 1, []byte("world"))
-	f3 := createTestFrame(uint32(fakeConnectionId), 1, 2, []byte("!"))
+	f1 := createTestFrame(1, 1, 0, []byte("hello"))
+	f2 := createTestFrame(1, 1, 1, []byte("world"))
+	f3 := createTestFrame(1, 1, 2, []byte("!"))
 
-	// Order is reversed
+	// Order is reversed; the first (out-of-order) frame still opens the stream.
 	handleDataLocked(server, f3)
 	handleDataLocked(server, f2)
 	handleDataLocked(server, f1)
 
-	server.streams[fakeConnectionId].readMu.Lock()
-	if server.streams[fakeConnectionId].readSeq != 3 {
-		t.Fatalf("expected readSeq to be 3, got %d", server.streams[fakeConnectionId].readSeq)
+	s := serverStream(t, server, 1)
+	s.readMu.Lock()
+	seq := s.readSeq
+	s.readMu.Unlock()
+	if seq != 3 {
+		t.Fatalf("expected readSeq to be 3, got %d", seq)
 	}
-	if string(server.streams[fakeConnectionId].readBuf[:server.streams[fakeConnectionId].readLen]) != "helloworld!" {
-		t.Fatalf("expected readBuf to contain 'helloworld!', got %q", string(server.streams[fakeConnectionId].readBuf[:server.streams[fakeConnectionId].readLen]))
+
+	buf := make([]byte, 64)
+	n, err := s.Read(buf)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
 	}
-	server.streams[fakeConnectionId].readMu.Unlock()
+	if string(buf[:n]) != "helloworld!" {
+		t.Fatalf("expected 'helloworld!', got %q", string(buf[:n]))
+	}
 }
 
 func TestPingPong(t *testing.T) {

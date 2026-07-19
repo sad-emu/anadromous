@@ -13,7 +13,11 @@ import (
 // known capacity, so the retry interval stays constant regardless of loss.
 
 // retransmitEntry tracks a single sent frame pending acknowledgement.
+// Besides DATA frames this also covers FIN and RESET frames, which occupy
+// the sequence position after the stream's last data frame and are ACKed
+// through the same per-stream sequence space.
 type retransmitEntry struct {
+	ftype    uint8
 	streamID uint32
 	seq      uint32
 	data     []byte // owned copy of the payload
@@ -36,18 +40,31 @@ func retransmitKey(streamID, seq uint32) uint64 {
 }
 
 // add records a sent frame as pending acknowledgement. payload is copied.
-func (q *retransmitQueue) add(streamID, seq uint32, payload []byte) {
+func (q *retransmitQueue) add(ftype uint8, streamID, seq uint32, payload []byte) {
 	data := make([]byte, len(payload))
 	copy(data, payload)
 
 	q.mu.Lock()
 	q.entries[retransmitKey(streamID, seq)] = &retransmitEntry{
+		ftype:    ftype,
 		streamID: streamID,
 		seq:      seq,
 		data:     data,
 		sentAt:   time.Now(),
 	}
 	q.mu.Unlock()
+}
+
+// hasStream reports whether any entries remain pending for a stream.
+func (q *retransmitQueue) hasStream(streamID uint32) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for _, e := range q.entries {
+		if e.streamID == streamID {
+			return true
+		}
+	}
+	return false
 }
 
 // ackOne removes a single acknowledged frame from the queue.

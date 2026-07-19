@@ -27,10 +27,12 @@ type config struct {
 	recvBufSize       int
 	sendBufSize       int
 	batchSize         int
+	maxPayload        int // max frame payload bytes per datagram
 	handshakeTimout   time.Duration
 	keepAlive         time.Duration
 	retransmitTmout   time.Duration
 	retransmitRetries int
+	bindDevice        string // SO_BINDTODEVICE interface name, empty = unbound
 	socketOpts        func(*unet.Socket)
 }
 
@@ -41,12 +43,16 @@ func defaultConfig() config {
 		recvBufSize:       defaultRecvBufSize,
 		sendBufSize:       defaultSendBufSize,
 		batchSize:         defaultBatchSize,
+		maxPayload:        defaultMaxPayloadSize,
 		handshakeTimout:   defaultHandshakeTimout,
 		keepAlive:         defaultKeepAlive,
 		retransmitTmout:   defaultRetransmitTimeout,
 		retransmitRetries: defaultRetransmitRetries,
 	}
 }
+
+// maxDatagram returns the full datagram buffer size for this config.
+func (c *config) maxDatagram() int { return frameHeaderSize + c.maxPayload }
 
 // Option configures a Listener or Dial.
 type Option func(*config)
@@ -84,6 +90,35 @@ func WithHandshakeTimeout(d time.Duration) Option {
 // WithKeepAlive sets the keep-alive ping interval. Zero disables.
 func WithKeepAlive(d time.Duration) Option {
 	return func(c *config) { c.keepAlive = d }
+}
+
+// WithIdleTimeout sets how long a silent peer is tolerated before the
+// connection is closed. Internally this drives the keep-alive ping interval
+// (d/3, with the connection declared dead after 3 missed pongs), so a dead
+// peer is detected within roughly d. Zero disables idle detection.
+// Equivalent to quic-go's MaxIdleTimeout.
+func WithIdleTimeout(d time.Duration) Option {
+	return func(c *config) { c.keepAlive = d / 3 }
+}
+
+// WithMaxDatagramSize sets the maximum UDP datagram size (frame header plus
+// payload) used for all frames on the connection. Both endpoints of a
+// connection MUST be configured with the same value: this library targets
+// links whose MTU is known, and does no path-MTU discovery. Values must
+// exceed the frame header overhead; anything else is ignored.
+// Equivalent to quic-go's InitialPacketSize.
+func WithMaxDatagramSize(n int) Option {
+	return func(c *config) {
+		if n > frameHeaderSize+8 {
+			c.maxPayload = n - frameHeaderSize
+		}
+	}
+}
+
+// WithBindToDevice binds the UDP socket to a network interface via
+// SO_BINDTODEVICE (Linux). Requires CAP_NET_RAW or root.
+func WithBindToDevice(ifname string) Option {
+	return func(c *config) { c.bindDevice = ifname }
 }
 
 // WithRetransmitTimeout sets the fixed interval a DATA frame waits for an ACK
