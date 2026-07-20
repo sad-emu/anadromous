@@ -618,7 +618,7 @@ func (s *Stream) maybeGrowLocked() {
 	now := time.Now()
 	occupied := s.readLen*2 >= oldCap
 	ramping := now.Sub(s.createdAt) < rampWindow &&
-		now.Sub(s.lastGrowAt) >= s.conn.cfg.retransmitTmout/rampIntervalFraction
+		now.Sub(s.lastGrowAt) >= s.conn.currentRTO()/rampIntervalFraction
 	if !occupied && !ramping {
 		return
 	}
@@ -642,7 +642,7 @@ func (s *Stream) maybeGrowLocked() {
 // triggering a wasteful duplicate resend. Caller holds readMu.
 func (s *Stream) maybeFastRetransmitLocked() {
 	now := time.Now()
-	grace := s.conn.cfg.retransmitTmout / reorderGraceFraction
+	grace := s.conn.currentRTO() / reorderGraceFraction
 
 	if s.readSeq != s.gapSeq {
 		// First sign of a new gap at this readSeq: start the clock, but

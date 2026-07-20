@@ -124,8 +124,11 @@ func WithBindToDevice(ifname string) Option {
 	return func(c *config) { c.bindDevice = ifname }
 }
 
-// WithRetransmitTimeout sets the fixed interval a DATA frame waits for an ACK
-// before being retransmitted. There is no backoff: this interval never grows.
+// WithRetransmitTimeout sets the initial interval a DATA frame waits for an
+// ACK before being retransmitted, used until enough RTT samples arrive to
+// adapt it (see Connection.updateRTO), and as a floor afterwards so a burst
+// of atypically fast samples can't drive it low enough to cause spurious
+// retransmissions.
 func WithRetransmitTimeout(d time.Duration) Option {
 	return func(c *config) { c.retransmitTmout = d }
 }

@@ -89,6 +89,15 @@ type Connection struct {
 	rttMs       atomic.Int64
 	missedPongs int32
 
+	// RTT/RTO estimation (RFC 6298, Jacobson/Karels): srtt/rttvar are only
+	// touched by updateRTO, called from handleACK and the PONG handler,
+	// both of which already run under recvMu. rtoNs is the published,
+	// lock-free view of the current RTO that retransmitLoop and
+	// fast-retransmit read from any goroutine — see currentRTO.
+	srtt   time.Duration
+	rttvar time.Duration
+	rtoNs  atomic.Int64
+
 	// statResends counts frames retransmitted over the connection lifetime.
 	statResends atomic.Int64
 
@@ -115,6 +124,7 @@ func newConnection(sock *unet.Socket, fd int, remote unet.Address, connID uint64
 		streamFreedCh: make(chan struct{}, 1),
 	}
 	c.rttMs.Store(-1)
+	c.rtoNs.Store(int64(cfg.retransmitTmout))
 
 	// Client-initiated streams use odd IDs (1,3,5,...).
 	// Server-initiated streams use even IDs (2,4,6,...).
@@ -443,7 +453,7 @@ func (c *Connection) retransmitLoop() {
 		case <-ticker.C:
 		}
 
-		resend := c.retransmit.due(c.cfg.retransmitTmout)
+		resend := c.retransmit.due(c.currentRTO())
 
 		for _, e := range resend {
 			buf, idx, err := c.acquireSendSlot()
@@ -594,8 +604,10 @@ func (c *Connection) handleDatagram(buf []byte) {
 		c.sendControlFrame(framePong, f.streamID, f.seq)
 	case framePong:
 		if sentAt := c.sendPingMs.Load(); sentAt > 0 {
-			c.rttMs.Store(time.Now().UnixMilli() - sentAt)
+			rttMs := time.Now().UnixMilli() - sentAt
+			c.rttMs.Store(rttMs)
 			c.sendPingMs.Store(0)
+			c.updateRTO(time.Duration(rttMs) * time.Millisecond)
 		}
 	case frameGoAway:
 		go c.Close()
@@ -792,7 +804,10 @@ func (c *Connection) handleACK(f frame) {
 	if err != nil {
 		return // discard malformed ACK
 	}
-	freed := c.retransmit.ackMany(f.streamID, seqs)
+	freed, rttSamples := c.retransmit.ackMany(f.streamID, seqs)
+	for _, sample := range rttSamples {
+		c.updateRTO(sample)
+	}
 	if freed == 0 {
 		return
 	}
@@ -975,6 +990,45 @@ func parseAddr(addr string) (host string, port int, err error) {
 // Returns negative RTT if no ping-pong exchange has completed yet.
 func (c *Connection) GetRtt() int64 {
 	return c.rttMs.Load()
+}
+
+// updateRTO folds a new RTT sample into the SRTT/RTTVAR estimate (RFC 6298,
+// the same Jacobson/Karels algorithm TCP uses) and republishes the resulting
+// RTO. Samples come from two sources: DATA frames that were ACKed without
+// ever being retransmitted (handleACK — excluding retransmitted frames
+// follows Karn's algorithm, since an ACK for a multiply-sent frame can't be
+// attributed to a specific transmission), and the keep-alive PING/PONG
+// round trip as a fallback when no data is flowing. Caller holds recvMu.
+func (c *Connection) updateRTO(sample time.Duration) {
+	if sample <= 0 {
+		return
+	}
+	if c.srtt == 0 {
+		c.srtt = sample
+		c.rttvar = sample / 2
+	} else {
+		diff := c.srtt - sample
+		if diff < 0 {
+			diff = -diff
+		}
+		c.rttvar += (diff - c.rttvar) / 4
+		c.srtt += (sample - c.srtt) / 8
+	}
+	rto := c.srtt + 4*c.rttvar
+	// cfg.retransmitTmout doubles as a floor: it's the best guess available
+	// before any real samples exist, and afterwards it protects against a
+	// burst of atypically fast samples driving the RTO low enough to cause
+	// spurious retransmissions.
+	if min := c.cfg.retransmitTmout; rto < min {
+		rto = min
+	}
+	c.rtoNs.Store(int64(rto))
+}
+
+// currentRTO returns the connection's current adaptive retransmit timeout.
+// Safe to call from any goroutine without recvMu.
+func (c *Connection) currentRTO() time.Duration {
+	return time.Duration(c.rtoNs.Load())
 }
 
 func (c *Connection) SendPing(streamId uint32, seq uint32) error {

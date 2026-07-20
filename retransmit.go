@@ -7,10 +7,12 @@ import (
 	"time"
 )
 
-// retransmit.go implements fixed-interval, no-backoff retransmission of
-// unacknowledged DATA frames. There is deliberately no exponential backoff
-// or congestion-driven pacing here: this protocol targets WAN links with
-// known capacity, so the retry interval stays constant regardless of loss.
+// retransmit.go implements retransmission of unacknowledged DATA frames on
+// an interval that adapts to the connection's measured RTT (SRTT/RTTVAR via
+// RFC 6298 — see Connection.updateRTO), rather than a fixed guess. There is
+// still no exponential per-attempt backoff or congestion-driven pacing here:
+// repeated retries of the same frame all use the same connection-wide
+// adaptive interval rather than growing it individually.
 //
 // A frame is retried for as long as the connection itself is alive — there
 // is deliberately no separate per-frame retry-count give-up. An earlier
@@ -90,13 +92,21 @@ func (q *retransmitQueue) ackOne(streamID, seq uint32) {
 
 // ackMany removes a batch of acknowledged frames for one stream, returning
 // the total payload size of the removed entries so the caller can shrink the
-// stream's bytes-in-flight accounting (see Stream.creditAcked).
-func (q *retransmitQueue) ackMany(streamID uint32, seqs []uint32) (freedBytes int) {
+// stream's bytes-in-flight accounting (see Stream.creditAcked), plus an RTT
+// sample for each entry that was ACKed without ever being retransmitted.
+// Retransmitted entries are excluded per Karn's algorithm: an ACK for a
+// multiply-sent frame can't be attributed to a specific transmission, so
+// timing it would poison the RTO estimate.
+func (q *retransmitQueue) ackMany(streamID uint32, seqs []uint32) (freedBytes int, rttSamples []time.Duration) {
+	now := time.Now()
 	q.mu.Lock()
 	for _, seq := range seqs {
 		key := retransmitKey(streamID, seq)
 		if e, ok := q.entries[key]; ok {
 			freedBytes += len(e.data)
+			if e.retries == 0 {
+				rttSamples = append(rttSamples, now.Sub(e.sentAt))
+			}
 			delete(q.entries, key)
 		}
 	}
