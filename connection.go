@@ -312,10 +312,19 @@ func (c *Connection) sendReliableFrame(ftype uint8, streamID, seq uint32, payloa
 	return c.flushSend()
 }
 
-// sendWindowUpdate grants the peer additional flow-control credit for a
-// stream. The credit rides in the header's seq field; there is no payload.
-func (c *Connection) sendWindowUpdate(streamID uint32, credit uint32) error {
-	return c.sendControlFrame(frameWindowUpdate, streamID, credit)
+// sendWindowUpdate informs the peer of the absolute (cumulative) offset it
+// is now allowed to send up to on a stream. Sent unreliably and never
+// retransmitted — see windowUpdatePayload for why that's safe.
+func (c *Connection) sendWindowUpdate(streamID uint32, offset uint64) error {
+	buf, idx, err := c.acquireSendSlot()
+	if err != nil {
+		return err
+	}
+	n := encodeFrame(buf, frameWindowUpdate, streamID, 0, windowUpdatePayload(offset))
+	if err := c.commitSendSlot(idx, n); err != nil {
+		return err
+	}
+	return c.flushSend()
 }
 
 // sendControlFrame sends a control frame (no payload) immediately.
@@ -743,13 +752,17 @@ func (c *Connection) handleStopSending(f frame) {
 	}
 }
 
-// handleWindowUpdate credits a stream's send window.
+// handleWindowUpdate applies an absolute send watermark to a stream.
 func (c *Connection) handleWindowUpdate(f frame) {
+	offset, err := decodeWindowUpdatePayload(f.payload)
+	if err != nil {
+		return // discard malformed window update
+	}
 	c.streamMu.RLock()
 	s, ok := c.streams[f.streamID]
 	c.streamMu.RUnlock()
 	if ok {
-		s.addSendCredit(f.seq)
+		s.setMaxSendOffset(int64(offset))
 	}
 }
 

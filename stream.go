@@ -38,6 +38,7 @@ type Stream struct {
 	readErr      error  // sticky read result: io.EOF, ErrStreamReset, ErrStreamClosed
 	readCanceled bool   // CancelRead called: incoming data is ACKed and discarded
 	grantPending int    // bytes consumed by the app since the last window grant
+	peerOffset   int64  // absolute watermark we've most recently told the peer it may send up to
 	readDeadline time.Time
 
 	// write side — guarded by writeMu.
@@ -46,7 +47,8 @@ type Stream struct {
 	writeSeq      uint32 // next data sequence number to send
 	writeFIN      bool   // FIN (or reset) sent; no further writes
 	writeErr      error  // sticky write error (ErrStreamReset, ErrStreamClosed, ...)
-	sendWindow    int64  // flow-control credit remaining
+	maxSendOffset int64  // absolute watermark the peer has granted us; available credit is maxSendOffset-sentOffset
+	sentOffset    int64  // cumulative bytes sent so far
 	writeDeadline time.Time
 }
 
@@ -61,11 +63,12 @@ func newStream(id uint32, conn *Connection, bufSize int) *Stream {
 		initial = min
 	}
 	s := &Stream{
-		id:         id,
-		conn:       conn,
-		readBuf:    make([]byte, initial),
-		reorder:    make(map[uint32][]byte),
-		sendWindow: int64(initial),
+		id:            id,
+		conn:          conn,
+		readBuf:       make([]byte, initial),
+		reorder:       make(map[uint32][]byte),
+		peerOffset:    int64(initial),
+		maxSendOffset: int64(initial),
 	}
 	s.readCond = sync.NewCond(&s.readMu)
 	s.writeCond = sync.NewCond(&s.writeMu)
@@ -148,7 +151,7 @@ func (s *Stream) Read(p []byte) (n int, err error) {
 	if s.grantPending >= len(s.readBuf)/4 {
 		credit := s.grantPending
 		s.grantPending = 0
-		s.conn.sendWindowUpdate(s.id, uint32(credit))
+		s.grantLocked(credit)
 	}
 	return n, nil
 }
@@ -174,7 +177,7 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 		// Never overshoot the window: the receiver's ring is sized exactly
 		// to the credit it has granted, so an oversized frame would be
 		// dropped and limp in via retransmission.
-		for s.sendWindow < int64(chunkLen) && s.writeErr == nil && !s.writeFIN {
+		for s.maxSendOffset-s.sentOffset < int64(chunkLen) && s.writeErr == nil && !s.writeFIN {
 			// Push anything queued before blocking — the credit we are
 			// waiting for only arrives once the peer receives this data.
 			s.conn.flushSend()
@@ -198,7 +201,7 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 		}
 
 		chunk := p[:chunkLen]
-		s.sendWindow -= int64(chunkLen)
+		s.sentOffset += int64(chunkLen)
 		seq := s.writeSeq
 		s.writeSeq++
 
@@ -215,11 +218,17 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 	return n, nil
 }
 
-// addSendCredit is called when the peer grants flow-control credit.
-func (s *Stream) addSendCredit(credit uint32) {
+// setMaxSendOffset applies an absolute flow-control watermark received from
+// the peer. Only monotonic increases are applied: a reordered, duplicate, or
+// stale (superseded) update is a harmless no-op rather than corrupting the
+// window, which is what lets these updates go unretransmitted on a lossy
+// link — see windowUpdatePayload.
+func (s *Stream) setMaxSendOffset(offset int64) {
 	s.writeMu.Lock()
-	s.sendWindow += int64(credit)
-	s.writeCond.Broadcast()
+	if offset > s.maxSendOffset {
+		s.maxSendOffset = offset
+		s.writeCond.Broadcast()
+	}
 	s.writeMu.Unlock()
 }
 
@@ -342,7 +351,7 @@ func (s *Stream) deliver(seq uint32, payload []byte, isFin bool) (ack bool) {
 		// stop, and return the discarded bytes as credit so a peer that
 		// missed our STOP_SENDING doesn't stall on flow control.
 		if len(payload) > 0 {
-			s.conn.sendWindowUpdate(s.id, uint32(len(payload)))
+			s.grantLocked(len(payload))
 		}
 		return true
 	}
@@ -525,7 +534,7 @@ func (s *Stream) growLocked(need int) bool {
 		return false
 	}
 	s.reallocRingLocked(newCap)
-	s.conn.sendWindowUpdate(s.id, uint32(newCap-oldCap))
+	s.grantLocked(newCap - oldCap)
 	return true
 }
 
@@ -542,7 +551,17 @@ func (s *Stream) maybeGrowLocked() {
 		newCap = max
 	}
 	s.reallocRingLocked(newCap)
-	s.conn.sendWindowUpdate(s.id, uint32(newCap-oldCap))
+	s.grantLocked(newCap - oldCap)
+}
+
+// grantLocked increases the cumulative offset granted to the peer by delta
+// bytes and sends the new absolute watermark. Caller holds readMu.
+func (s *Stream) grantLocked(delta int) {
+	if delta <= 0 {
+		return
+	}
+	s.peerOffset += int64(delta)
+	s.conn.sendWindowUpdate(s.id, uint64(s.peerOffset))
 }
 
 // reallocRingLocked linearizes the ring contents into a new buffer of the

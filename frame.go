@@ -14,7 +14,7 @@ const (
 	frameStreamOpen   uint8 = 0x02 // Open a new stream
 	frameStreamClose  uint8 = 0x03 // Graceful close (both directions)
 	frameStreamFIN    uint8 = 0x04 // Half-close (sender done writing)
-	frameWindowUpdate uint8 = 0x05 // Flow control window increase
+	frameWindowUpdate uint8 = 0x05 // Flow control: absolute (cumulative) send watermark
 	framePing         uint8 = 0x06 // Keep-alive ping
 	framePong         uint8 = 0x07 // Ping response
 	frameGoAway       uint8 = 0x08 // Connection shutting down
@@ -133,6 +133,35 @@ func decodeFrame(buf []byte) (f frame, err error) {
 	if f.length > 0 {
 		f.payload = buf[frameHeaderSize:total]
 	}
+	return
+}
+
+// windowUpdatePayload encodes a WINDOW_UPDATE frame payload carrying an
+// absolute (cumulative) flow-control watermark: the total number of bytes
+// the peer is allowed to have sent on this stream since it opened.
+//
+// This is deliberately cumulative rather than a delta, and the frame is sent
+// unreliably (never retransmitted). A delta would be lost forever if its
+// datagram were dropped, permanently starving the sender's window on a lossy
+// link. A cumulative watermark is idempotent: applying an equal or smaller
+// value is a no-op (see Stream.setMaxSendOffset), so a dropped update is
+// simply superseded by the next, larger one — self-healing under loss with
+// no retransmission machinery needed, the same trick QUIC's MAX_STREAM_DATA
+// uses.
+func windowUpdatePayload(offset uint64) []byte {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, offset)
+	return b
+}
+
+// decodeWindowUpdatePayload extracts the absolute watermark from a
+// WINDOW_UPDATE frame's payload.
+func decodeWindowUpdatePayload(payload []byte) (offset uint64, err error) {
+	if len(payload) < 8 {
+		err = errors.New("window update payload too small")
+		return
+	}
+	offset = binary.BigEndian.Uint64(payload)
 	return
 }
 
