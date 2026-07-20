@@ -22,6 +22,7 @@ const (
 	frameHandshake    uint8 = 0x0A // Connection handshake
 	frameStreamReset  uint8 = 0x0B // Abort the sender's write side (like QUIC RESET_STREAM)
 	frameStopSending  uint8 = 0x0C // Ask the peer to stop sending (like QUIC STOP_SENDING)
+	frameNack         uint8 = 0x0D // Fast retransmit: resend one specific (stream, seq) frame now
 )
 
 // frameHeaderSize is the fixed size of a frame header on the wire.

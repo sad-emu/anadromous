@@ -11,6 +11,20 @@ import (
 // unacknowledged DATA frames. There is deliberately no exponential backoff
 // or congestion-driven pacing here: this protocol targets WAN links with
 // known capacity, so the retry interval stays constant regardless of loss.
+//
+// A frame is retried for as long as the connection itself is alive — there
+// is deliberately no separate per-frame retry-count give-up. An earlier
+// version failed a stream with ErrRetransmitExceeded after a fixed number of
+// attempts, but a single frame struggling under a transient, correlated loss
+// burst (common on bad WAN links, and easily several seconds long) isn't
+// evidence the peer is gone, and killing the stream over it tore down
+// whatever was on top of it (e.g. a TCP connection being bridged) even
+// though the network — and the transfer — would have recovered shortly
+// after. Whether the peer is actually gone is exactly what the connection's
+// idle timeout already determines, correctly and robustly (it resets on any
+// received frame, not just a dedicated pong — see handleDatagram); that is
+// now the only mechanism that gives up on a stalled connection, and it takes
+// every stream down with it via Connection.Close.
 
 // retransmitEntry tracks a single sent frame pending acknowledgement.
 // Besides DATA frames this also covers FIN and RESET frames, which occupy
@@ -22,7 +36,7 @@ type retransmitEntry struct {
 	seq      uint32
 	data     []byte // owned copy of the payload
 	sentAt   time.Time
-	retries  int
+	retries  int // resend attempts so far, diagnostic only
 }
 
 // retransmitQueue manages pending unacknowledged frames for a Connection.
@@ -74,13 +88,20 @@ func (q *retransmitQueue) ackOne(streamID, seq uint32) {
 	q.mu.Unlock()
 }
 
-// ackMany removes a batch of acknowledged frames for one stream.
-func (q *retransmitQueue) ackMany(streamID uint32, seqs []uint32) {
+// ackMany removes a batch of acknowledged frames for one stream, returning
+// the total payload size of the removed entries so the caller can shrink the
+// stream's bytes-in-flight accounting (see Stream.creditAcked).
+func (q *retransmitQueue) ackMany(streamID uint32, seqs []uint32) (freedBytes int) {
 	q.mu.Lock()
 	for _, seq := range seqs {
-		delete(q.entries, retransmitKey(streamID, seq))
+		key := retransmitKey(streamID, seq)
+		if e, ok := q.entries[key]; ok {
+			freedBytes += len(e.data)
+			delete(q.entries, key)
+		}
 	}
 	q.mu.Unlock()
+	return
 }
 
 // purgeStream removes all pending entries belonging to a stream, e.g. when
@@ -95,20 +116,32 @@ func (q *retransmitQueue) purgeStream(streamID uint32) {
 	q.mu.Unlock()
 }
 
-// due returns a snapshot of entries that have been outstanding for at least
-// rto, and are still under maxRetries. Their sentAt/retries are bumped in
-// place so a subsequent scan won't immediately re-select them. Entries that
-// have exceeded maxRetries are removed and returned separately via exceeded.
-func (q *retransmitQueue) due(rto time.Duration, maxRetries int) (resend []retransmitEntry, exceeded []retransmitEntry) {
+// getForResend returns a copy of the pending entry for (streamID, seq) for
+// an immediate fast-retransmit resend, bumping its sentAt/retries exactly
+// like due() would, so the periodic scanner doesn't immediately re-select it
+// too. ok is false if the frame isn't outstanding (already acknowledged, or
+// a stale/unknown NACK) — callers must treat that as a no-op, not an error.
+func (q *retransmitQueue) getForResend(streamID, seq uint32) (e retransmitEntry, ok bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	key := retransmitKey(streamID, seq)
+	entry, found := q.entries[key]
+	if !found {
+		return retransmitEntry{}, false
+	}
+	entry.sentAt = time.Now()
+	entry.retries++
+	return *entry, true
+}
+
+// due returns a snapshot of entries that have been outstanding (since their
+// last resend) for at least rto. Their sentAt/retries are bumped in place so
+// a subsequent scan won't immediately re-select them.
+func (q *retransmitQueue) due(rto time.Duration) (resend []retransmitEntry) {
 	now := time.Now()
 	q.mu.Lock()
-	for k, e := range q.entries {
+	for _, e := range q.entries {
 		if now.Sub(e.sentAt) < rto {
-			continue
-		}
-		if e.retries >= maxRetries {
-			exceeded = append(exceeded, *e)
-			delete(q.entries, k)
 			continue
 		}
 		e.sentAt = now

@@ -8,10 +8,38 @@ import (
 	"time"
 )
 
+// reorderGraceFraction sets how long a gap must persist — evidenced by a
+// second out-of-order arrival for the same still-missing sequence, spaced at
+// least retransmitTmout/reorderGraceFraction apart — before it's treated as
+// loss worth a fast retransmit. A single out-of-order arrival is ordinary
+// evidence of packet reordering, not proof of loss (netem-style "packet
+// jumps the queue" reordering typically resolves within one jitter window),
+// so NACKing on first sight of a gap mostly fires on reordering rather than
+// real loss and wastes bandwidth on duplicate resends over an already lossy
+// link. The same duration throttles repeat NACKs for a gap that stays open.
+const reorderGraceFraction = 4
+
 // initialStreamWindow is the flow-control credit (and receive ring size) a
-// stream starts with. The receive ring grows on demand up to the configured
-// stream buffer size, granting the peer additional credit as it does.
+// stream starts with, before the ramp described below grows it.
 const initialStreamWindow = 256 * 1024
+
+// rampWindow is how long after a stream opens its window keeps doubling on a
+// fixed pace (see rampIntervalFraction) instead of only when the ring is at
+// least half full. Starting straight at cfg.streamBufSize (the operator's
+// declared bandwidth-delay product) sounds appealing but is unsafe: nothing
+// else in this protocol paces the sender, so an instantly-huge window lets
+// it blast far more in-flight data than any real intermediate queue (a
+// router buffer, or netem's default 1000-packet qdisc limit in testing) can
+// hold, causing a burst of loss much worse than the link's steady-state
+// rate and, if retransmits exhaust their retry budget during that burst,
+// killing the stream outright. A bounded, paced ramp — doubling roughly
+// every rampIntervalFraction of an RTO, the same way TCP slow start grows
+// roughly every RTT — reaches a large window quickly without that burst.
+const rampWindow = 3 * time.Second
+
+// rampIntervalFraction sets the pace of the ramp above: doublings are at
+// most retransmitTmout/rampIntervalFraction apart.
+const rampIntervalFraction = 4
 
 // Stream is a bidirectional byte stream multiplexed over a Connection.
 //
@@ -24,22 +52,27 @@ type Stream struct {
 	conn *Connection
 
 	// read side — everything below is guarded by readMu.
-	readMu       sync.Mutex
-	readCond     *sync.Cond
-	readBuf      []byte            // ring buffer; grows geometrically up to cfg.streamBufSize
-	readHead     int               // next read position
-	readTail     int               // next write position
-	readLen      int               // buffered bytes count
-	readSeq      uint32            // next expected sequence number
-	reorder      map[uint32][]byte // out-of-order frames awaiting earlier seqs
-	reorderBytes int
-	finRecvd     bool   // peer sent FIN
-	finSeq       uint32 // seq position of the peer's FIN (== count of data frames)
-	readErr      error  // sticky read result: io.EOF, ErrStreamReset, ErrStreamClosed
-	readCanceled bool   // CancelRead called: incoming data is ACKed and discarded
-	grantPending int    // bytes consumed by the app since the last window grant
-	peerOffset   int64  // absolute watermark we've most recently told the peer it may send up to
-	readDeadline time.Time
+	readMu         sync.Mutex
+	readCond       *sync.Cond
+	readBuf        []byte            // ring buffer; grows geometrically up to cfg.streamBufSize
+	readHead       int               // next read position
+	readTail       int               // next write position
+	readLen        int               // buffered bytes count
+	readSeq        uint32            // next expected sequence number
+	reorder        map[uint32][]byte // out-of-order frames awaiting earlier seqs
+	reorderBytes   int
+	finRecvd       bool      // peer sent FIN
+	finSeq         uint32    // seq position of the peer's FIN (== count of data frames)
+	readErr        error     // sticky read result: io.EOF, ErrStreamReset, ErrStreamClosed
+	readCanceled   bool      // CancelRead called: incoming data is ACKed and discarded
+	grantPending   int       // bytes consumed by the app since the last window grant
+	peerOffset     int64     // absolute watermark we've most recently told the peer it may send up to
+	gapSeq         uint32    // readSeq value of the gap currently being tracked for fast retransmit
+	gapFirstSeenAt time.Time // when that gap was first observed
+	lastNackAt     time.Time // when a NACK was last sent for the current gap
+	createdAt      time.Time // stream creation time; bounds the ramp-up window
+	lastGrowAt     time.Time // when the ring last grew, paces the ramp-up
+	readDeadline   time.Time
 
 	// write side — guarded by writeMu.
 	writeMu       sync.Mutex
@@ -49,6 +82,7 @@ type Stream struct {
 	writeErr      error  // sticky write error (ErrStreamReset, ErrStreamClosed, ...)
 	maxSendOffset int64  // absolute watermark the peer has granted us; available credit is maxSendOffset-sentOffset
 	sentOffset    int64  // cumulative bytes sent so far
+	ackedBytes    int64  // cumulative bytes acknowledged so far (not necessarily contiguous — ACKs are selective)
 	writeDeadline time.Time
 }
 
@@ -62,6 +96,7 @@ func newStream(id uint32, conn *Connection, bufSize int) *Stream {
 	if min := 2 * conn.cfg.maxPayload; initial < min {
 		initial = min
 	}
+	now := time.Now()
 	s := &Stream{
 		id:            id,
 		conn:          conn,
@@ -69,6 +104,8 @@ func newStream(id uint32, conn *Connection, bufSize int) *Stream {
 		reorder:       make(map[uint32][]byte),
 		peerOffset:    int64(initial),
 		maxSendOffset: int64(initial),
+		createdAt:     now,
+		lastGrowAt:    now,
 	}
 	s.readCond = sync.NewCond(&s.readMu)
 	s.writeCond = sync.NewCond(&s.writeMu)
@@ -174,10 +211,18 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 		if chunkLen > maxPayload {
 			chunkLen = maxPayload
 		}
-		// Never overshoot the window: the receiver's ring is sized exactly
-		// to the credit it has granted, so an oversized frame would be
-		// dropped and limp in via retransmission.
-		for s.maxSendOffset-s.sentOffset < int64(chunkLen) && s.writeErr == nil && !s.writeFIN {
+		// Never overshoot the flow-control window (the receiver's ring is
+		// sized exactly to the credit it has granted, so an oversized frame
+		// would be dropped and limp in via retransmission), and never let
+		// more than one window's worth of data sit unacknowledged: bound
+		// bytes in flight so a loss burst makes Write block (backpressure)
+		// instead of piling arbitrarily more outstanding retries on top of
+		// an already-struggling path, which is what was driving streams to
+		// ErrRetransmitExceeded — and the TCP teardown/broken-pipe on the
+		// application side that followed — under sustained loss.
+		for s.writeErr == nil && !s.writeFIN &&
+			(s.maxSendOffset-s.sentOffset < int64(chunkLen) ||
+				s.bytesInFlightLocked()+int64(chunkLen) > int64(s.maxBufSize())) {
 			// Push anything queued before blocking — the credit we are
 			// waiting for only arrives once the peer receives this data.
 			s.conn.flushSend()
@@ -229,6 +274,24 @@ func (s *Stream) setMaxSendOffset(offset int64) {
 		s.maxSendOffset = offset
 		s.writeCond.Broadcast()
 	}
+	s.writeMu.Unlock()
+}
+
+// bytesInFlightLocked returns how many sent-but-not-yet-acknowledged bytes
+// are currently outstanding for this stream. Caller holds writeMu.
+func (s *Stream) bytesInFlightLocked() int64 {
+	return s.sentOffset - s.ackedBytes
+}
+
+// creditAcked records newly-acknowledged bytes, shrinking bytesInFlight and
+// waking any writer blocked on the in-flight cap in Write.
+func (s *Stream) creditAcked(n int) {
+	if n <= 0 {
+		return
+	}
+	s.writeMu.Lock()
+	s.ackedBytes += int64(n)
+	s.writeCond.Broadcast()
 	s.writeMu.Unlock()
 }
 
@@ -382,6 +445,7 @@ func (s *Stream) deliver(seq uint32, payload []byte, isFin bool) (ack bool) {
 		copy(cp, payload)
 		s.reorder[seq] = cp
 		s.reorderBytes += len(payload)
+		s.maybeFastRetransmitLocked()
 		return true
 	}
 
@@ -538,20 +602,60 @@ func (s *Stream) growLocked(need int) bool {
 	return true
 }
 
-// maybeGrowLocked proactively doubles the ring when it is at least half
-// full, granting the delta as credit, so throughput ramps up to the
-// configured buffer size without waiting for a stall.
+// maybeGrowLocked doubles the ring, granting the delta as credit, so
+// throughput ramps up to the configured buffer size without waiting for a
+// stall. Growth fires for either of two reasons: the ring is at least half
+// full (the original occupancy signal — the current window is visibly not
+// enough), or the stream is still within its early rampWindow and has gone
+// at least one ramp interval since its last growth (a fixed, paced climb
+// towards the configured ceiling that doesn't wait to be proven necessary,
+// but also doesn't hand it all out at once — see rampWindow).
 func (s *Stream) maybeGrowLocked() {
 	oldCap := len(s.readBuf)
-	if s.readLen*2 < oldCap || oldCap >= s.maxBufSize() {
+	if oldCap >= s.maxBufSize() {
+		return
+	}
+	now := time.Now()
+	occupied := s.readLen*2 >= oldCap
+	ramping := now.Sub(s.createdAt) < rampWindow &&
+		now.Sub(s.lastGrowAt) >= s.conn.cfg.retransmitTmout/rampIntervalFraction
+	if !occupied && !ramping {
 		return
 	}
 	newCap := oldCap * 2
 	if max := s.maxBufSize(); newCap > max {
 		newCap = max
 	}
+	s.lastGrowAt = now
 	s.reallocRingLocked(newCap)
 	s.grantLocked(newCap - oldCap)
+}
+
+// maybeFastRetransmitLocked asks the peer to immediately resend the next
+// expected frame (s.readSeq) once we have reasonable evidence it's actually
+// lost rather than merely reordered: a second out-of-order arrival for the
+// same still-missing sequence, spaced at least one grace period after the
+// first. This recovers a lost DATA frame in a small multiple of the RTT
+// instead of waiting for the fixed retransmit timeout — the same idea as TCP
+// fast-retransmit / QUIC's ACK-driven loss detection — while the grace
+// period keeps ordinary packet reordering from being mistaken for loss and
+// triggering a wasteful duplicate resend. Caller holds readMu.
+func (s *Stream) maybeFastRetransmitLocked() {
+	now := time.Now()
+	grace := s.conn.cfg.retransmitTmout / reorderGraceFraction
+
+	if s.readSeq != s.gapSeq {
+		// First sign of a new gap at this readSeq: start the clock, but
+		// don't NACK yet.
+		s.gapSeq = s.readSeq
+		s.gapFirstSeenAt = now
+		return
+	}
+	if now.Sub(s.gapFirstSeenAt) < grace || now.Sub(s.lastNackAt) < grace {
+		return
+	}
+	s.lastNackAt = now
+	s.conn.sendControlFrame(frameNack, s.id, s.readSeq)
 }
 
 // grantLocked increases the cumulative offset granted to the peer by delta

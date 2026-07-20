@@ -10,44 +10,41 @@ import (
 
 const (
 	defaultMaxStreams        = 1024
-	defaultStreamBufSize     = 256 * 1024 // 256 KB per-stream read buffer
+	defaultStreamBufSize     = 128 * 1024 * 1024 // 128 MB per-stream read buffer
 	defaultRecvBufSize       = 4 * 1024 * 1024
 	defaultSendBufSize       = 4 * 1024 * 1024
 	defaultBatchSize         = 64 // number of messages per recvmmsg/sendmmsg batch
 	defaultHandshakeTimout   = 5 * time.Second
 	defaultKeepAlive         = 10 * time.Second
 	defaultRetransmitTimeout = 300 * time.Millisecond
-	defaultRetransmitRetries = 15
 	defaultHandshakeRetryIvl = 250 * time.Millisecond
 )
 
 type config struct {
-	maxStreams        int
-	streamBufSize     int
-	recvBufSize       int
-	sendBufSize       int
-	batchSize         int
-	maxPayload        int // max frame payload bytes per datagram
-	handshakeTimout   time.Duration
-	keepAlive         time.Duration
-	retransmitTmout   time.Duration
-	retransmitRetries int
-	bindDevice        string // SO_BINDTODEVICE interface name, empty = unbound
-	socketOpts        func(*unet.Socket)
+	maxStreams      int
+	streamBufSize   int
+	recvBufSize     int
+	sendBufSize     int
+	batchSize       int
+	maxPayload      int // max frame payload bytes per datagram
+	handshakeTimout time.Duration
+	keepAlive       time.Duration
+	retransmitTmout time.Duration
+	bindDevice      string // SO_BINDTODEVICE interface name, empty = unbound
+	socketOpts      func(*unet.Socket)
 }
 
 func defaultConfig() config {
 	return config{
-		maxStreams:        defaultMaxStreams,
-		streamBufSize:     defaultStreamBufSize,
-		recvBufSize:       defaultRecvBufSize,
-		sendBufSize:       defaultSendBufSize,
-		batchSize:         defaultBatchSize,
-		maxPayload:        defaultMaxPayloadSize,
-		handshakeTimout:   defaultHandshakeTimout,
-		keepAlive:         defaultKeepAlive,
-		retransmitTmout:   defaultRetransmitTimeout,
-		retransmitRetries: defaultRetransmitRetries,
+		maxStreams:      defaultMaxStreams,
+		streamBufSize:   defaultStreamBufSize,
+		recvBufSize:     defaultRecvBufSize,
+		sendBufSize:     defaultSendBufSize,
+		batchSize:       defaultBatchSize,
+		maxPayload:      defaultMaxPayloadSize,
+		handshakeTimout: defaultHandshakeTimout,
+		keepAlive:       defaultKeepAlive,
+		retransmitTmout: defaultRetransmitTimeout,
 	}
 }
 
@@ -62,7 +59,13 @@ func WithMaxStreams(n int) Option {
 	return func(c *config) { c.maxStreams = n }
 }
 
-// WithStreamBufferSize sets the per-stream receive buffer size in bytes.
+// WithStreamBufferSize sets the per-stream receive buffer (and starting
+// flow-control window) size in bytes. Streams start at this size immediately
+// rather than growing into it: this protocol has no congestion control by
+// design (WAN links with known, manually-tuned capacity), so size this to
+// the link's bandwidth-delay product rather than treating it as a cautious
+// upper bound — a stream allocates this much memory up front, multiplied by
+// however many concurrent streams a connection opens (see WithMaxStreams).
 func WithStreamBufferSize(n int) Option {
 	return func(c *config) { c.streamBufSize = n }
 }
@@ -125,12 +128,6 @@ func WithBindToDevice(ifname string) Option {
 // before being retransmitted. There is no backoff: this interval never grows.
 func WithRetransmitTimeout(d time.Duration) Option {
 	return func(c *config) { c.retransmitTmout = d }
-}
-
-// WithRetransmitMaxRetries sets how many times a DATA frame is retransmitted
-// before its stream is failed with ErrRetransmitExceeded.
-func WithRetransmitMaxRetries(n int) Option {
-	return func(c *config) { c.retransmitRetries = n }
 }
 
 // WithSocketOptions provides an escape hatch for setting arbitrary unet socket options.

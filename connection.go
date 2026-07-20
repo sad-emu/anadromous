@@ -443,7 +443,7 @@ func (c *Connection) retransmitLoop() {
 		case <-ticker.C:
 		}
 
-		resend, exceeded := c.retransmit.due(c.cfg.retransmitTmout, c.cfg.retransmitRetries)
+		resend := c.retransmit.due(c.cfg.retransmitTmout)
 
 		for _, e := range resend {
 			buf, idx, err := c.acquireSendSlot()
@@ -456,16 +456,6 @@ func (c *Connection) retransmitLoop() {
 		if len(resend) > 0 {
 			c.statResends.Add(int64(len(resend)))
 			c.flushSend()
-		}
-
-		for _, e := range exceeded {
-			c.streamMu.RLock()
-			s, ok := c.streams[e.streamID]
-			c.streamMu.RUnlock()
-			if ok {
-				s.deliverError(ErrRetransmitExceeded)
-				c.removeStream(e.streamID)
-			}
 		}
 
 		c.gcStreams()
@@ -576,6 +566,16 @@ func (c *Connection) handleDatagram(buf []byte) {
 		return // discard malformed frames
 	}
 
+	// Any successfully decoded frame from the peer is proof of life: reset
+	// the idle/keepalive counter here rather than only on framePong. Ping is
+	// a tiny, unreliable, single-packet control frame like any other, so
+	// under loss it (or its reply) can be dropped several times in a row
+	// even while the connection is actively exchanging bulk DATA/ACK traffic
+	// — that's not an idle peer, and treating it as one contradicts
+	// WithIdleTimeout's documented "equivalent to quic-go's MaxIdleTimeout"
+	// behavior, where the idle timer resets on any received packet.
+	atomic.StoreInt32(&c.missedPongs, 0)
+
 	c.recvMu.Lock()
 	defer c.recvMu.Unlock()
 
@@ -593,7 +593,6 @@ func (c *Connection) handleDatagram(buf []byte) {
 	case framePing:
 		c.sendControlFrame(framePong, f.streamID, f.seq)
 	case framePong:
-		atomic.StoreInt32(&c.missedPongs, 0)
 		if sentAt := c.sendPingMs.Load(); sentAt > 0 {
 			c.rttMs.Store(time.Now().UnixMilli() - sentAt)
 			c.sendPingMs.Store(0)
@@ -602,6 +601,8 @@ func (c *Connection) handleDatagram(buf []byte) {
 		go c.Close()
 	case frameACK:
 		c.handleACK(f)
+	case frameNack:
+		c.handleNack(f)
 	case frameHandshake:
 		c.handleHandshake(f)
 	default:
@@ -791,7 +792,37 @@ func (c *Connection) handleACK(f frame) {
 	if err != nil {
 		return // discard malformed ACK
 	}
-	c.retransmit.ackMany(f.streamID, seqs)
+	freed := c.retransmit.ackMany(f.streamID, seqs)
+	if freed == 0 {
+		return
+	}
+	c.streamMu.RLock()
+	s, ok := c.streams[f.streamID]
+	c.streamMu.RUnlock()
+	if ok {
+		s.creditAcked(freed)
+	}
+}
+
+// handleNack immediately resends the single (stream, seq) frame the peer is
+// missing, bypassing the fixed-interval retransmit timer. This is the
+// fast-retransmit path: the peer only sends a NACK once it has direct
+// evidence of the gap (a later frame already arrived), so recovery happens
+// in about one RTT instead of waiting out the timer.
+func (c *Connection) handleNack(f frame) {
+	e, ok := c.retransmit.getForResend(f.streamID, f.seq)
+	if !ok {
+		return // already acknowledged, or a stale/unknown NACK
+	}
+	buf, idx, err := c.acquireSendSlot()
+	if err != nil {
+		return
+	}
+	n := encodeFrame(buf, e.ftype, e.streamID, e.seq, e.data)
+	if c.commitSendSlot(idx, n) == nil {
+		c.statResends.Add(1)
+		c.flushSend()
+	}
 }
 
 // tombstoneTTL is how long a removed stream's ID keeps ACKing late

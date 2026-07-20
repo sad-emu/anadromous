@@ -11,18 +11,15 @@ func TestRetransmitQueueAddDue(t *testing.T) {
 	q := newRetransmitQueue()
 	q.add(frameData, 1, 0, []byte("hello"))
 
-	resend, exceeded := q.due(10*time.Millisecond, 5)
-	if len(resend) != 0 || len(exceeded) != 0 {
-		t.Fatalf("expected nothing due immediately, got resend=%d exceeded=%d", len(resend), len(exceeded))
+	resend := q.due(10 * time.Millisecond)
+	if len(resend) != 0 {
+		t.Fatalf("expected nothing due immediately, got resend=%d", len(resend))
 	}
 
 	time.Sleep(15 * time.Millisecond)
-	resend, exceeded = q.due(10*time.Millisecond, 5)
+	resend = q.due(10 * time.Millisecond)
 	if len(resend) != 1 {
 		t.Fatalf("expected 1 due entry, got %d", len(resend))
-	}
-	if len(exceeded) != 0 {
-		t.Fatalf("expected 0 exceeded entries, got %d", len(exceeded))
 	}
 	if resend[0].streamID != 1 || resend[0].seq != 0 || string(resend[0].data) != "hello" {
 		t.Fatalf("unexpected entry: %+v", resend[0])
@@ -38,7 +35,7 @@ func TestRetransmitQueueAckRemoves(t *testing.T) {
 	q.ackMany(1, []uint32{0, 1})
 
 	time.Sleep(5 * time.Millisecond)
-	resend, _ := q.due(0, 5)
+	resend := q.due(time.Millisecond)
 	if len(resend) != 1 || resend[0].streamID != 2 {
 		t.Fatalf("expected only stream 2's entry to remain due, got %+v", resend)
 	}
@@ -52,31 +49,9 @@ func TestRetransmitQueuePurgeStream(t *testing.T) {
 	q.purgeStream(1)
 
 	time.Sleep(5 * time.Millisecond)
-	resend, _ := q.due(0, 5)
+	resend := q.due(time.Millisecond)
 	if len(resend) != 1 || resend[0].streamID != 2 {
 		t.Fatalf("expected only stream 2's entry to remain, got %+v", resend)
-	}
-}
-
-func TestRetransmitQueueExceededRetries(t *testing.T) {
-	q := newRetransmitQueue()
-	q.add(frameData, 1, 0, []byte("a"))
-
-	// First scan: retries goes 0 -> 1, still under maxRetries=1... use 0 to
-	// force immediate exceed on first due scan.
-	time.Sleep(2 * time.Millisecond)
-	resend, exceeded := q.due(0, 0)
-	if len(resend) != 0 {
-		t.Fatalf("expected no resend once already at maxRetries, got %d", len(resend))
-	}
-	if len(exceeded) != 1 {
-		t.Fatalf("expected 1 exceeded entry, got %d", len(exceeded))
-	}
-
-	// Entry should be gone now.
-	resend, exceeded = q.due(0, 100)
-	if len(resend) != 0 || len(exceeded) != 0 {
-		t.Fatalf("expected queue empty after exceeding retries, got resend=%d exceeded=%d", len(resend), len(exceeded))
 	}
 }
 
