@@ -118,7 +118,7 @@ func newConnection(sock *unet.Socket, fd int, remote unet.Address, connID uint64
 		acceptCh:      make(chan *Stream, cfg.maxStreams),
 		closeCh:       make(chan struct{}),
 		isClient:      isClient,
-		retransmit:    newRetransmitQueue(),
+		retransmit:    newRetransmitQueue(cfg.maxPayload),
 		establishedCh: make(chan struct{}),
 		deadStreams:   make(map[uint32]time.Time),
 		streamFreedCh: make(chan struct{}, 1),
@@ -155,15 +155,23 @@ func newConnection(sock *unet.Socket, fd int, remote unet.Address, connID uint64
 		recvIdx++
 	}, nil) // connected socket, no name needed
 
-	// Set up batched send endpoint.
+	// Set up batched send endpoint. Two iovecs per message: iov[0] is the
+	// slot's own buffer, used either for a fully-encoded frame (header and
+	// payload combined, for the low-traffic control frame types) or just the
+	// header (for DATA/FIN/RESET, whose payload lives in the retransmit
+	// arena — see commitSendSlotZeroCopy); iov[1] is unused (Len 0) in the
+	// former case and points directly at the arena buffer in the latter, so
+	// that payload is never copied into a send buffer at all.
 	c.sendBufs = make([][]byte, cfg.batchSize)
 	c.sendLens = make([]int, cfg.batchSize)
 	sendIdx := 0
-	c.sendEP.SetupVectors(cfg.batchSize, 1, func(iov []syscall.Iovec) {
+	c.sendEP.SetupVectors(cfg.batchSize, 2, func(iov []syscall.Iovec) {
 		b := make([]byte, maxDatagram)
 		c.sendBufs[sendIdx] = b
 		iov[0].Base = &b[0]
 		iov[0].Len = 0 // set to actual frame size on each send
+		iov[1].Base = nil
+		iov[1].Len = 0 // set per-send when the zero-copy path is used
 		sendIdx++
 	}, nil) // connected socket, no name needed
 
@@ -291,34 +299,36 @@ func (c *Connection) Close() error {
 // --- send path (batched via sendmmsg) ---
 
 // sendDataFrame queues a DATA frame and records it for retransmission until
-// acknowledged. It does not flush; callers that want the frame on the wire
-// immediately (or after queuing several) must call flushSend().
+// acknowledged. payload is copied once into the retransmit arena (see
+// retransmitQueue.add) and referenced directly on the wire from there — see
+// commitSendSlotZeroCopy — rather than copied again into a send buffer. It
+// does not flush; callers that want the frame on the wire immediately (or
+// after queuing several) must call flushSend().
 func (c *Connection) sendDataFrame(streamID, seq uint32, payload []byte) error {
+	data := c.retransmit.add(frameData, streamID, seq, payload)
 	buf, idx, err := c.acquireSendSlot()
 	if err != nil {
 		return err
 	}
-	n := encodeFrame(buf, frameData, streamID, seq, payload)
-	if err := c.commitSendSlot(idx, n); err != nil {
-		return err
-	}
-	c.retransmit.add(frameData, streamID, seq, payload)
-	return nil
+	encodeHeader(buf, frameData, streamID, seq, uint32(len(data)))
+	return c.commitSendSlotZeroCopy(idx, data)
 }
 
 // sendReliableFrame sends a frame immediately and retransmits it until the
 // peer acknowledges its (streamID, seq). Used for FIN and RESET frames,
 // which occupy the sequence position after the stream's last data frame.
+// Like sendDataFrame, payload is copied once into the retransmit arena and
+// referenced directly on the wire rather than copied again.
 func (c *Connection) sendReliableFrame(ftype uint8, streamID, seq uint32, payload []byte) error {
+	data := c.retransmit.add(ftype, streamID, seq, payload)
 	buf, idx, err := c.acquireSendSlot()
 	if err != nil {
 		return err
 	}
-	n := encodeFrame(buf, ftype, streamID, seq, payload)
-	if err := c.commitSendSlot(idx, n); err != nil {
+	encodeHeader(buf, ftype, streamID, seq, uint32(len(data)))
+	if err := c.commitSendSlotZeroCopy(idx, data); err != nil {
 		return err
 	}
-	c.retransmit.add(ftype, streamID, seq, payload)
 	return c.flushSend()
 }
 
@@ -380,14 +390,48 @@ func (c *Connection) acquireSendSlot() (buf []byte, idx int, err error) {
 	return buf, idx, nil
 }
 
-// commitSendSlot finishes writing to a send slot, flushing only if the
-// batch is now full. Caller holds sendMu (acquired by acquireSendSlot) and
-// this releases it.
+// commitSendSlot finishes writing a fully-encoded frame (header and payload
+// both already written into the slot's own buffer) to a send slot, flushing
+// only if the batch is now full. Caller holds sendMu (acquired by
+// acquireSendSlot) and this releases it.
 func (c *Connection) commitSendSlot(idx int, n int) error {
-	// Update the iov length for this message.
-	c.sendEP.Iov[idx].Len = uint64(n)
+	base := idx * 2
+	c.sendEP.Iov[base].Len = uint64(n)
+	c.sendEP.Iov[base+1].Base = nil
+	c.sendEP.Iov[base+1].Len = 0
 	c.sendEP.Hdrs[idx].NTransferred = 0
 	c.sendLens[idx] = n
+	c.sendN = idx + 1
+
+	var err error
+	if c.sendN >= c.cfg.batchSize {
+		err = c.flushSendLocked()
+	}
+	c.sendMu.Unlock()
+	return err
+}
+
+// commitSendSlotZeroCopy finishes a slot whose header has already been
+// written (via encodeHeader) into the first frameHeaderSize bytes of its own
+// buffer, and points the slot's second iovec directly at payload instead of
+// copying payload in — the kernel gathers the two iovecs into one datagram
+// during sendmmsg, so payload is sent by reference. This is only safe
+// because payload is always an arena-owned buffer that retransmitQueue
+// guarantees won't be reused until drainPendingFree runs, which this
+// function's caller (via flushSendLocked) only does after the batch
+// referencing it has already been handed to the kernel. Caller holds sendMu
+// (acquired by acquireSendSlot) and this releases it.
+func (c *Connection) commitSendSlotZeroCopy(idx int, payload []byte) error {
+	base := idx * 2
+	c.sendEP.Iov[base].Len = uint64(frameHeaderSize)
+	if len(payload) > 0 {
+		c.sendEP.Iov[base+1].Base = &payload[0]
+	} else {
+		c.sendEP.Iov[base+1].Base = nil
+	}
+	c.sendEP.Iov[base+1].Len = uint64(len(payload))
+	c.sendEP.Hdrs[idx].NTransferred = 0
+	c.sendLens[idx] = frameHeaderSize + len(payload)
 	c.sendN = idx + 1
 
 	var err error
@@ -423,9 +467,17 @@ func (c *Connection) flushSendLocked() error {
 
 	// Reset iov lens for next batch.
 	for i := 0; i < n; i++ {
-		c.sendEP.Iov[i].Len = uint64(c.cfg.maxDatagram())
+		base := i * 2
+		c.sendEP.Iov[base].Len = uint64(c.cfg.maxDatagram())
+		c.sendEP.Iov[base+1].Base = nil
+		c.sendEP.Iov[base+1].Len = 0
 		c.sendEP.Hdrs[i].NTransferred = 0
 	}
+
+	// The batch (and every zero-copy arena pointer in it) has now been
+	// handed to the kernel, so any arena buffers freed by ACKs/purges while
+	// it was pending are safe to recycle — see retransmitQueue.drainPendingFree.
+	c.retransmit.drainPendingFree()
 
 	if errno != 0 {
 		return errno
@@ -460,8 +512,8 @@ func (c *Connection) retransmitLoop() {
 			if err != nil {
 				break // connection is going away
 			}
-			n := encodeFrame(buf, e.ftype, e.streamID, e.seq, e.data)
-			c.commitSendSlot(idx, n)
+			encodeHeader(buf, e.ftype, e.streamID, e.seq, uint32(len(e.data)))
+			c.commitSendSlotZeroCopy(idx, e.data)
 		}
 		if len(resend) > 0 {
 			c.statResends.Add(int64(len(resend)))
@@ -833,8 +885,8 @@ func (c *Connection) handleNack(f frame) {
 	if err != nil {
 		return
 	}
-	n := encodeFrame(buf, e.ftype, e.streamID, e.seq, e.data)
-	if c.commitSendSlot(idx, n) == nil {
+	encodeHeader(buf, e.ftype, e.streamID, e.seq, uint32(len(e.data)))
+	if c.commitSendSlotZeroCopy(idx, e.data) == nil {
 		c.statResends.Add(1)
 		c.flushSend()
 	}

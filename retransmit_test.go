@@ -8,7 +8,7 @@ import (
 )
 
 func TestRetransmitQueueAddDue(t *testing.T) {
-	q := newRetransmitQueue()
+	q := newRetransmitQueue(defaultMaxPayloadSize)
 	q.add(frameData, 1, 0, []byte("hello"))
 
 	resend := q.due(10 * time.Millisecond)
@@ -27,7 +27,7 @@ func TestRetransmitQueueAddDue(t *testing.T) {
 }
 
 func TestRetransmitQueueAckRemoves(t *testing.T) {
-	q := newRetransmitQueue()
+	q := newRetransmitQueue(defaultMaxPayloadSize)
 	q.add(frameData, 1, 0, []byte("a"))
 	q.add(frameData, 1, 1, []byte("b"))
 	q.add(frameData, 2, 0, []byte("c"))
@@ -42,7 +42,7 @@ func TestRetransmitQueueAckRemoves(t *testing.T) {
 }
 
 func TestRetransmitQueuePurgeStream(t *testing.T) {
-	q := newRetransmitQueue()
+	q := newRetransmitQueue(defaultMaxPayloadSize)
 	q.add(frameData, 1, 0, []byte("a"))
 	q.add(frameData, 2, 0, []byte("b"))
 
