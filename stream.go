@@ -423,11 +423,17 @@ func (s *Stream) deliver(seq uint32, payload []byte, isFin bool) (ack bool) {
 	defer s.readMu.Unlock()
 
 	if s.readCanceled || s.readErr != nil {
-		// Read side is done — discard, but ACK so the peer's retransmits
-		// stop, and return the discarded bytes as credit so a peer that
-		// missed our STOP_SENDING doesn't stall on flow control.
+		// Read side is done — discard, but acknowledge so the peer's
+		// retransmits stop, and return the discarded bytes as credit so a
+		// peer that missed our STOP_SENDING doesn't stall on flow control.
+		// Acknowledgement happens by advancing readSeq past the discarded
+		// frame: the cumulative watermark in our ACK snapshot then covers
+		// it (and everything before it — frames we'll never deliver anyway).
 		if len(payload) > 0 {
 			s.grantLocked(len(payload))
+		}
+		if seq >= s.readSeq {
+			s.readSeq = seq + 1
 		}
 		return true
 	}
@@ -730,6 +736,30 @@ func (s *Stream) maybeFastRetransmitLocked() {
 	if len(gaps) > 0 {
 		s.conn.sendNackFrame(s.id, gaps)
 	}
+}
+
+// ackSnapshot returns the stream's receive state for an ACK frame: the
+// cumulative contiguous watermark (every seq below it received or
+// discarded) and the seqs received beyond it — the buffered out-of-order
+// frames, plus the FIN's seq once seen. Because it describes state rather
+// than events, the resulting ACK is idempotent: re-advertised on every
+// flush, so any single lost ACK frame is healed by the next one. seqs
+// reuses scratch's backing array and is capped at maxSeqs.
+func (s *Stream) ackSnapshot(scratch []uint32, maxSeqs int) (cum uint32, seqs []uint32) {
+	s.readMu.Lock()
+	cum = s.readSeq
+	seqs = scratch[:0]
+	if s.finRecvd && s.finSeq >= cum && len(seqs) < maxSeqs {
+		seqs = append(seqs, s.finSeq)
+	}
+	for seq := range s.reorder {
+		if len(seqs) >= maxSeqs {
+			break
+		}
+		seqs = append(seqs, seq)
+	}
+	s.readMu.Unlock()
+	return
 }
 
 // grantLocked increases the cumulative offset granted to the peer by delta

@@ -58,8 +58,9 @@ func TestRetransmitQueuePurgeStream(t *testing.T) {
 func TestAckFrameRoundTrip(t *testing.T) {
 	buf := make([]byte, defaultMaxDatagramSize)
 	seqs := []uint32{1, 2, 5, 9, 100}
+	const cum = uint32(77)
 
-	n := encodeAckFrame(buf, 42, seqs)
+	n := encodeAckFrame(buf, 42, cum, seqs)
 
 	f, err := decodeFrame(buf[:n])
 	if err != nil {
@@ -72,9 +73,12 @@ func TestAckFrameRoundTrip(t *testing.T) {
 		t.Fatalf("expected streamID 42, got %d", f.streamID)
 	}
 
-	got, err := decodeAckFrame(f)
+	gotCum, got, err := decodeSeqListFrame(f, nil)
 	if err != nil {
-		t.Fatalf("decodeAckFrame: %v", err)
+		t.Fatalf("decodeSeqListFrame: %v", err)
+	}
+	if gotCum != cum {
+		t.Fatalf("expected cumulative %d, got %d", cum, gotCum)
 	}
 	if len(got) != len(seqs) {
 		t.Fatalf("expected %d seqs, got %d", len(seqs), len(got))
@@ -83,5 +87,38 @@ func TestAckFrameRoundTrip(t *testing.T) {
 		if got[i] != s {
 			t.Fatalf("seq %d: expected %d, got %d", i, s, got[i])
 		}
+	}
+}
+
+func TestRetransmitQueueAckCumulative(t *testing.T) {
+	q := newRetransmitQueue(defaultMaxPayloadSize)
+	q.add(frameData, 1, 0, []byte("aa"))
+	q.add(frameData, 1, 1, []byte("bb"))
+	q.add(frameData, 1, 2, []byte("cc"))
+	q.add(frameData, 2, 0, []byte("dd"))
+
+	freed, _ := q.ackCumulative(1, 2) // covers seqs 0 and 1 of stream 1
+	if freed != 4 {
+		t.Fatalf("expected 4 freed bytes, got %d", freed)
+	}
+
+	// Repeat and stale cumulative values are no-ops.
+	if freed, _ := q.ackCumulative(1, 2); freed != 0 {
+		t.Fatalf("expected repeat cumulative to free 0, got %d", freed)
+	}
+	if freed, _ := q.ackCumulative(1, 1); freed != 0 {
+		t.Fatalf("expected stale cumulative to free 0, got %d", freed)
+	}
+
+	// An implausibly huge jump is treated as corruption and ignored.
+	if freed, _ := q.ackCumulative(1, 1<<30); freed != 0 {
+		t.Fatalf("expected corrupt cumulative to free 0, got %d", freed)
+	}
+
+	// Streams 1 (seq 2) and 2 (seq 0) remain.
+	time.Sleep(2 * time.Millisecond)
+	resend := q.due(time.Millisecond)
+	if len(resend) != 2 {
+		t.Fatalf("expected 2 remaining entries, got %d: %+v", len(resend), resend)
 	}
 }

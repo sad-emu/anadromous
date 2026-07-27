@@ -62,8 +62,10 @@ type Connection struct {
 	streams       map[uint32]*Stream
 	nextStream    uint32 // next stream ID to allocate
 	acceptCh      chan *Stream
-	sReadIdsToAck map[uint32][]uint32 // packet IDs to ACK per stream (recvMu)
-	ackScratch    []uint32            // reused decode buffer for incoming ACK frames (recvMu)
+	sReadIdsToAck map[uint32][]uint32 // explicit seqs to ACK per stream — dead-stream/reset paths (recvMu)
+	sAckDirty     map[uint32]struct{} // live streams with arrivals since the last ACK flush (recvMu)
+	ackScratch    []uint32            // reused decode buffer for incoming ACK/NACK frames (recvMu)
+	ackSnapBuf    []uint32            // reused snapshot buffer for outgoing ACK frames (recvMu)
 
 	// deadStreams are tombstones for recently removed streams (recvMu).
 	// Late retransmits for them are ACKed and discarded instead of
@@ -207,6 +209,7 @@ func newConnection(sock *unet.Socket, fd int, remote unet.Address, connID uint64
 
 	// Set up batched receive endpoint.
 	c.sReadIdsToAck = make(map[uint32][]uint32)
+	c.sAckDirty = make(map[uint32]struct{})
 	c.recvBufs = make([][]byte, cfg.batchSize)
 	recvIdx := 0
 	c.recvEP.SetupVectors(cfg.batchSize, 1, func(iov []syscall.Iovec) {
@@ -431,10 +434,10 @@ func (c *Connection) sendControlFrame(ftype uint8, streamID, seq uint32) error {
 	return c.flushSend()
 }
 
-// sendACKFrame sends an ACK frame acknowledging receipt of a set of data
-// frames immediately. len(seqs) must not exceed maxAckSeqsPerFrame.
-func (c *Connection) sendACKFrame(streamID uint32, seqs []uint32) error {
-	if err := c.queueACKFrame(streamID, seqs); err != nil {
+// sendACKFrame sends an ACK frame immediately.
+// len(seqs) must not exceed maxAckSeqsPerFrame.
+func (c *Connection) sendACKFrame(streamID, cumulative uint32, seqs []uint32) error {
+	if err := c.queueACKFrame(streamID, cumulative, seqs); err != nil {
 		return err
 	}
 	return c.flushSend()
@@ -448,7 +451,7 @@ func (c *Connection) sendNackFrame(streamID uint32, seqs []uint32) error {
 	if err != nil {
 		return err
 	}
-	n := encodeSeqListFrame(buf, frameNack, streamID, seqs)
+	n := encodeSeqListFrame(buf, frameNack, streamID, 0, seqs)
 	if err := c.commitSendSlot(idx, n); err != nil {
 		return err
 	}
@@ -477,12 +480,12 @@ func (c *Connection) queueResendFrame(e retransmitEntry) error {
 // ACK frames (one per stream per receive batch — see
 // flushPendingAcksLocked) costs one sendmmsg instead of one per frame.
 // len(seqs) must not exceed maxAckSeqsPerFrame.
-func (c *Connection) queueACKFrame(streamID uint32, seqs []uint32) error {
+func (c *Connection) queueACKFrame(streamID, cumulative uint32, seqs []uint32) error {
 	buf, idx, err := c.acquireSendSlot()
 	if err != nil {
 		return err
 	}
-	n := encodeAckFrame(buf, streamID, seqs)
+	n := encodeAckFrame(buf, streamID, cumulative, seqs)
 	return c.commitSendSlot(idx, n)
 }
 
@@ -872,13 +875,33 @@ func (c *Connection) flushPendingAcks() {
 }
 
 // flushPendingAcksLocked sends any accumulated ACKs, chunked to fit the wire
-// format. Called after each receive batch, holding recvMu. The per-stream
-// seq slices are truncated in place and retained in the map (rather than the
-// old swap-in-a-fresh-map approach) so steady-state flushing allocates
-// nothing; removeStream deletes a stream's slot when the stream goes away.
+// format. Called after each receive batch, holding recvMu.
+//
+// Live streams marked dirty this batch get a snapshot ACK — their full
+// receive state (cumulative watermark + out-of-order seqs), idempotent and
+// re-advertised every flush so lost ACK frames self-heal. Explicit seq
+// lists (cumulative=0) remain for the paths with no live stream state to
+// snapshot: dead-stream/tombstone acking and RESET/late-FIN handling. The
+// per-stream slices/buffers are truncated in place and retained so
+// steady-state flushing allocates nothing; removeStream deletes a stream's
+// slots when it goes away.
 func (c *Connection) flushPendingAcksLocked() {
 	maxAcks := maxAckSeqsPerFrame(c.cfg.maxPayload)
 	queued := false
+
+	for streamID := range c.sAckDirty {
+		c.streamMu.RLock()
+		s := c.streams[streamID]
+		c.streamMu.RUnlock()
+		if s != nil {
+			cum, seqs := s.ackSnapshot(c.ackSnapBuf, maxAcks)
+			c.ackSnapBuf = seqs[:0]
+			c.queueACKFrame(streamID, cum, seqs)
+			queued = true
+		}
+		delete(c.sAckDirty, streamID)
+	}
+
 	for streamID, seqs := range c.sReadIdsToAck {
 		if len(seqs) == 0 {
 			continue
@@ -889,7 +912,7 @@ func (c *Connection) flushPendingAcksLocked() {
 			if n > maxAcks {
 				n = maxAcks
 			}
-			c.queueACKFrame(streamID, rest[:n])
+			c.queueACKFrame(streamID, 0, rest[:n])
 			rest = rest[n:]
 		}
 		queued = true
@@ -900,9 +923,16 @@ func (c *Connection) flushPendingAcksLocked() {
 	}
 }
 
-// queueAck records a (stream, seq) for the next ACK flush. Caller holds recvMu.
+// queueAck records an explicit (stream, seq) for the next ACK flush, for
+// frames with no live stream to snapshot. Caller holds recvMu.
 func (c *Connection) queueAck(streamID, seq uint32) {
 	c.sReadIdsToAck[streamID] = append(c.sReadIdsToAck[streamID], seq)
+}
+
+// markAckDirty schedules a live stream for a snapshot ACK at the next
+// flush. Caller holds recvMu.
+func (c *Connection) markAckDirty(streamID uint32) {
+	c.sAckDirty[streamID] = struct{}{}
 }
 
 // streamForFrame resolves the stream a DATA/FIN frame belongs to, creating
@@ -975,9 +1005,12 @@ func (c *Connection) handleData(f frame) {
 		}
 		return
 	}
-	if s.deliver(f.seq, f.payload, false) {
-		c.queueAck(f.streamID, f.seq)
-	}
+	// Mark for a snapshot ACK regardless of deliver's verdict: duplicates
+	// mean the peer is retransmitting something our snapshot already covers
+	// — evidence a previous ACK was lost — so re-advertising the snapshot
+	// is exactly the right response.
+	s.deliver(f.seq, f.payload, false)
+	c.markAckDirty(f.streamID)
 }
 
 func (c *Connection) handleStreamFIN(f frame) {
@@ -988,9 +1021,8 @@ func (c *Connection) handleStreamFIN(f frame) {
 		}
 		return
 	}
-	if s.deliver(f.seq, nil, true) {
-		c.queueAck(f.streamID, f.seq)
-	}
+	s.deliver(f.seq, nil, true)
+	c.markAckDirty(f.streamID)
 }
 
 // handleStreamReset processes a peer's write-side abort. Resets are
@@ -1052,15 +1084,21 @@ func (c *Connection) handleHandshake(f frame) {
 }
 
 func (c *Connection) handleACK(f frame) {
-	seqs, err := decodeAckFrameInto(f, c.ackScratch)
+	cum, seqs, err := decodeSeqListFrame(f, c.ackScratch)
 	if err != nil {
 		return // discard malformed ACK
 	}
 	c.ackScratch = seqs[:0] // retain capacity for the next ACK frame
-	freed, rttSample := c.retransmit.ackMany(f.streamID, seqs)
-	if rttSample > 0 {
-		c.updateRTO(rttSample)
+	freedCum, sampleCum := c.retransmit.ackCumulative(f.streamID, cum)
+	freedList, sampleList := c.retransmit.ackMany(f.streamID, seqs)
+	sample := sampleCum
+	if sample == 0 || (sampleList > 0 && sampleList < sample) {
+		sample = sampleList
 	}
+	if sample > 0 {
+		c.updateRTO(sample)
+	}
+	freed := freedCum + freedList
 	if freed == 0 {
 		return
 	}
@@ -1079,7 +1117,7 @@ func (c *Connection) handleACK(f frame) {
 // happens in about one RTT instead of waiting out the timer. Seqs that are
 // already acknowledged or unknown are silently skipped.
 func (c *Connection) handleNack(f frame) {
-	seqs, err := decodeAckFrameInto(f, c.ackScratch)
+	_, seqs, err := decodeSeqListFrame(f, c.ackScratch)
 	if err != nil {
 		return // discard malformed NACK
 	}
@@ -1118,9 +1156,10 @@ func (c *Connection) removeStream(id uint32) {
 
 	c.recvMu.Lock()
 	c.deadStreams[id] = time.Now()
-	// Drop the stream's retained ACK-accumulation slot (kept alive across
+	// Drop the stream's retained ACK-accumulation slots (kept alive across
 	// flushes for reuse — see flushPendingAcksLocked).
 	delete(c.sReadIdsToAck, id)
+	delete(c.sAckDirty, id)
 	c.recvMu.Unlock()
 
 	select {

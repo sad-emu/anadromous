@@ -38,10 +38,10 @@ const defaultMaxPayloadSize = 1200
 const defaultMaxDatagramSize = frameHeaderSize + defaultMaxPayloadSize
 
 // maxAckSeqsPerFrame returns the maximum number of sequence numbers that fit
-// in a single ACK frame's payload for a given max payload size:
-// [Count(4) | Seq(4) x N] <= maxPayload.
+// in a single ACK/NACK frame's payload for a given max payload size:
+// [Cumulative(4) | Count(4) | Seq(4) x N] <= maxPayload.
 func maxAckSeqsPerFrame(maxPayload int) int {
-	return (maxPayload - 4) / 4
+	return (maxPayload - 8) / 4
 }
 
 // frame represents a decoded frame header plus its payload.
@@ -74,43 +74,51 @@ func encodeFrame(buf []byte, ftype uint8, streamID, seq uint32, payload []byte) 
 // encodeSeqListFrame writes a complete seq-list frame (header + payload)
 // into buf; ACK and NACK share this format. The stream is carried in the
 // generic header's StreamID field; the payload is
-// [Count(4) | Seq1(4) | Seq2(4) | ...].
-// len(seqs) must not exceed maxAckSeqsPerFrame.
-func encodeSeqListFrame(buf []byte, ftype uint8, streamID uint32, seqs []uint32) int {
-	plen := uint32(4 + 4*len(seqs))
+// [Cumulative(4) | Count(4) | Seq1(4) | Seq2(4) | ...].
+//
+// For ACK, Cumulative=C means "every DATA seq below C has been received"
+// and the list holds seqs received beyond C (out-of-order frames, plus the
+// FIN seq once seen); an ACK is therefore an idempotent snapshot of receive
+// state, re-advertised on every flush, so a lost ACK frame is healed by the
+// next one instead of silently un-acknowledging a whole receive batch until
+// the retransmit timer re-sends it — the same reasoning as TCP cumulative
+// ACKs / QUIC ACK ranges. Cumulative=0 makes the frame an explicit-list-only
+// ACK (used for streams with no live receive state: tombstones, resets).
+// For NACK the Cumulative field is unused (0) and the list holds the seqs
+// to resend. len(seqs) must not exceed maxAckSeqsPerFrame.
+func encodeSeqListFrame(buf []byte, ftype uint8, streamID, cumulative uint32, seqs []uint32) int {
+	plen := uint32(8 + 4*len(seqs))
 	encodeHeader(buf, ftype, streamID, 0, plen)
-	binary.BigEndian.PutUint32(buf[frameHeaderSize:frameHeaderSize+4], uint32(len(seqs)))
+	binary.BigEndian.PutUint32(buf[frameHeaderSize:frameHeaderSize+4], cumulative)
+	binary.BigEndian.PutUint32(buf[frameHeaderSize+4:frameHeaderSize+8], uint32(len(seqs)))
 	for i, seq := range seqs {
-		off := frameHeaderSize + 4 + 4*i
+		off := frameHeaderSize + 8 + 4*i
 		binary.BigEndian.PutUint32(buf[off:off+4], seq)
 	}
 	return frameHeaderSize + int(plen)
 }
 
 // encodeAckFrame writes a complete ACK frame into buf.
-func encodeAckFrame(buf []byte, streamID uint32, seqs []uint32) int {
-	return encodeSeqListFrame(buf, frameACK, streamID, seqs)
+func encodeAckFrame(buf []byte, streamID, cumulative uint32, seqs []uint32) int {
+	return encodeSeqListFrame(buf, frameACK, streamID, cumulative, seqs)
 }
 
-// decodeAckFrame extracts the acknowledged sequence numbers from a decoded
-// ACK frame's payload. The acknowledged stream is f.streamID.
-func decodeAckFrame(f frame) (seqs []uint32, err error) {
-	return decodeAckFrameInto(f, nil)
-}
-
-// decodeAckFrameInto is decodeAckFrame decoding into scratch's backing array
-// when it has the capacity, so a caller processing a steady flow of ACK
-// frames (Connection.handleACK) can reuse one buffer instead of allocating
-// per frame.
-func decodeAckFrameInto(f frame, scratch []uint32) (seqs []uint32, err error) {
-	if len(f.payload) < 4 {
-		err = errors.New("ack payload too small")
+// decodeSeqListFrame extracts the cumulative watermark and explicit
+// sequence numbers from a decoded ACK/NACK frame's payload (see
+// encodeSeqListFrame for the semantics). The stream is f.streamID. Decodes
+// into scratch's backing array when it has the capacity, so a caller
+// processing a steady flow of frames can reuse one buffer instead of
+// allocating per frame.
+func decodeSeqListFrame(f frame, scratch []uint32) (cumulative uint32, seqs []uint32, err error) {
+	if len(f.payload) < 8 {
+		err = errors.New("seq-list payload too small")
 		return
 	}
-	count := int(binary.BigEndian.Uint32(f.payload[0:4]))
-	need := 4 + 4*count
+	cumulative = binary.BigEndian.Uint32(f.payload[0:4])
+	count := int(binary.BigEndian.Uint32(f.payload[4:8]))
+	need := 8 + 4*count
 	if len(f.payload) < need {
-		err = fmt.Errorf("ack payload truncated: have %d, need %d", len(f.payload), need)
+		err = fmt.Errorf("seq-list payload truncated: have %d, need %d", len(f.payload), need)
 		return
 	}
 	if cap(scratch) >= count {
@@ -119,7 +127,7 @@ func decodeAckFrameInto(f frame, scratch []uint32) (seqs []uint32, err error) {
 		seqs = make([]uint32, count)
 	}
 	for i := range seqs {
-		off := 4 + 4*i
+		off := 8 + 4*i
 		seqs[i] = binary.BigEndian.Uint32(f.payload[off : off+4])
 	}
 	return

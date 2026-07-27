@@ -117,12 +117,17 @@ type retransmitQueue struct {
 	arena       *retransmitArena
 	pendingFree [][]byte
 	scratch     []retransmitEntry // reused due() result; see due
+	// ackedThrough tracks, per stream, the seq below which every entry has
+	// already been swept by a cumulative ACK, so each sweep only visits
+	// newly-covered seqs — O(1) amortized per frame ever sent.
+	ackedThrough map[uint32]uint32
 }
 
 func newRetransmitQueue(maxPayload int) *retransmitQueue {
 	return &retransmitQueue{
-		entries: make(map[uint64]*retransmitEntry),
-		arena:   newRetransmitArena(maxPayload),
+		entries:      make(map[uint64]*retransmitEntry),
+		arena:        newRetransmitArena(maxPayload),
+		ackedThrough: make(map[uint32]uint32),
 	}
 }
 
@@ -255,6 +260,41 @@ func (q *retransmitQueue) ackMany(streamID uint32, seqs []uint32) (freedBytes in
 	return
 }
 
+// ackCumulative removes every pending entry of a stream with seq below cum
+// (the peer's cumulative receive watermark), returning freed payload bytes
+// and a minimum RTT sample from never-retransmitted entries just like
+// ackMany. Each seq is only ever swept once (ackedThrough advances), so the
+// total cost across a stream's lifetime is one map lookup per frame sent.
+// A watermark implausibly far beyond what has been swept so far is ignored
+// as corruption — this protocol has no frame checksum, and a bit-flipped
+// cumulative field must not be able to falsely acknowledge megabytes of
+// in-flight data (or spin this sweep for millions of iterations).
+func (q *retransmitQueue) ackCumulative(streamID, cum uint32) (freedBytes int, rttSample time.Duration) {
+	const maxCumAdvance = 1 << 20 // frames; far above any real in-flight window
+	now := time.Now()
+	q.mu.Lock()
+	from := q.ackedThrough[streamID]
+	if cum <= from || cum-from > maxCumAdvance {
+		q.mu.Unlock()
+		return
+	}
+	for seq := from; seq < cum; seq++ {
+		key := retransmitKey(streamID, seq)
+		if e, ok := q.entries[key]; ok {
+			freedBytes += len(e.data)
+			if e.retries == 0 {
+				if s := now.Sub(e.sentAt); rttSample == 0 || s < rttSample {
+					rttSample = s
+				}
+			}
+			q.removeLocked(key, e)
+		}
+	}
+	q.ackedThrough[streamID] = cum
+	q.mu.Unlock()
+	return
+}
+
 // purgeStream removes all pending entries belonging to a stream, e.g. when
 // the stream is closed or torn down.
 func (q *retransmitQueue) purgeStream(streamID uint32) {
@@ -264,6 +304,7 @@ func (q *retransmitQueue) purgeStream(streamID uint32) {
 			q.removeLocked(k, e)
 		}
 	}
+	delete(q.ackedThrough, streamID)
 	q.mu.Unlock()
 }
 
