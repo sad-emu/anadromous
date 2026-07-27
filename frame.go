@@ -22,7 +22,7 @@ const (
 	frameHandshake    uint8 = 0x0A // Connection handshake
 	frameStreamReset  uint8 = 0x0B // Abort the sender's write side (like QUIC RESET_STREAM)
 	frameStopSending  uint8 = 0x0C // Ask the peer to stop sending (like QUIC STOP_SENDING)
-	frameNack         uint8 = 0x0D // Fast retransmit: resend one specific (stream, seq) frame now
+	frameNack         uint8 = 0x0D // Fast retransmit: resend specific (stream, seq...) frames now; seq-list payload like ACK
 )
 
 // frameHeaderSize is the fixed size of a frame header on the wire.
@@ -71,19 +71,25 @@ func encodeFrame(buf []byte, ftype uint8, streamID, seq uint32, payload []byte) 
 	return frameHeaderSize + int(plen)
 }
 
-// encodeAckFrame writes a complete ACK frame (header + payload) into buf.
-// The stream being acknowledged is carried in the generic header's StreamID
-// field; the payload is [Count(4) | Seq1(4) | Seq2(4) | ...].
+// encodeSeqListFrame writes a complete seq-list frame (header + payload)
+// into buf; ACK and NACK share this format. The stream is carried in the
+// generic header's StreamID field; the payload is
+// [Count(4) | Seq1(4) | Seq2(4) | ...].
 // len(seqs) must not exceed maxAckSeqsPerFrame.
-func encodeAckFrame(buf []byte, streamID uint32, seqs []uint32) int {
+func encodeSeqListFrame(buf []byte, ftype uint8, streamID uint32, seqs []uint32) int {
 	plen := uint32(4 + 4*len(seqs))
-	encodeHeader(buf, frameACK, streamID, 0, plen)
+	encodeHeader(buf, ftype, streamID, 0, plen)
 	binary.BigEndian.PutUint32(buf[frameHeaderSize:frameHeaderSize+4], uint32(len(seqs)))
 	for i, seq := range seqs {
 		off := frameHeaderSize + 4 + 4*i
 		binary.BigEndian.PutUint32(buf[off:off+4], seq)
 	}
 	return frameHeaderSize + int(plen)
+}
+
+// encodeAckFrame writes a complete ACK frame into buf.
+func encodeAckFrame(buf []byte, streamID uint32, seqs []uint32) int {
+	return encodeSeqListFrame(buf, frameACK, streamID, seqs)
 }
 
 // decodeAckFrame extracts the acknowledged sequence numbers from a decoded

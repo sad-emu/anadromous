@@ -65,11 +65,14 @@ type Stream struct {
 	finSeq         uint32    // seq position of the peer's FIN (== count of data frames)
 	readErr        error     // sticky read result: io.EOF, ErrStreamReset, ErrStreamClosed
 	readCanceled   bool      // CancelRead called: incoming data is ACKed and discarded
+	reorderPool    [][]byte  // free list reusing reorder-copy buffers, capped at maxPayload each
 	grantPending   int       // bytes consumed by the app since the last window grant
 	peerOffset     int64     // absolute watermark we've most recently told the peer it may send up to
 	gapSeq         uint32    // readSeq value of the gap currently being tracked for fast retransmit
 	gapFirstSeenAt time.Time // when that gap was first observed
 	lastNackAt     time.Time // when a NACK was last sent for the current gap
+	maxSeenSeq     uint32    // highest data seq observed; bounds the NACK gap scan
+	nackScratch    []uint32  // reused gap-list buffer for NACK frames
 	createdAt      time.Time // stream creation time; bounds the ramp-up window
 	lastGrowAt     time.Time // when the ring last grew, paces the ramp-up
 	readDeadline   time.Time
@@ -213,16 +216,15 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 		}
 		// Never overshoot the flow-control window (the receiver's ring is
 		// sized exactly to the credit it has granted, so an oversized frame
-		// would be dropped and limp in via retransmission), and never let
-		// more than one window's worth of data sit unacknowledged: bound
-		// bytes in flight so a loss burst makes Write block (backpressure)
-		// instead of piling arbitrarily more outstanding retries on top of
-		// an already-struggling path, which is what was driving streams to
-		// ErrRetransmitExceeded — and the TCP teardown/broken-pipe on the
-		// application side that followed — under sustained loss.
+		// would be dropped and limp in via retransmission), and never exceed
+		// the in-flight cap: bound sent-but-unACKed bytes so a loss burst
+		// makes Write block (backpressure) instead of piling arbitrarily
+		// more outstanding retries on top of an already-struggling path.
+		// The cap (see WithMaxBytesInFlight) is what keeps a drop burst
+		// self-limiting rather than snowballing into persistent collapse.
 		for s.writeErr == nil && !s.writeFIN &&
 			(s.maxSendOffset-s.sentOffset < int64(chunkLen) ||
-				s.bytesInFlightLocked()+int64(chunkLen) > int64(s.maxBufSize())) {
+				s.bytesInFlightLocked()+int64(chunkLen) > s.inFlightCap()) {
 			// Push anything queued before blocking — the credit we are
 			// waiting for only arrives once the peer receives this data.
 			s.conn.flushSend()
@@ -281,6 +283,17 @@ func (s *Stream) setMaxSendOffset(offset int64) {
 // are currently outstanding for this stream. Caller holds writeMu.
 func (s *Stream) bytesInFlightLocked() int64 {
 	return s.sentOffset - s.ackedBytes
+}
+
+// inFlightCap is the bound Write enforces on bytesInFlight: the configured
+// or derived cap (see config.effectiveMaxInFlight), never more than the
+// stream buffer size.
+func (s *Stream) inFlightCap() int64 {
+	cap := s.conn.cfg.effectiveMaxInFlight()
+	if max := s.maxBufSize(); cap > max {
+		cap = max
+	}
+	return int64(cap)
 }
 
 // creditAcked records newly-acknowledged bytes, shrinking bytesInFlight and
@@ -429,6 +442,10 @@ func (s *Stream) deliver(seq uint32, payload []byte, isFin bool) (ack bool) {
 		return true
 	}
 
+	if seq > s.maxSeenSeq {
+		s.maxSeenSeq = seq
+	}
+
 	if seq < s.readSeq {
 		return true // duplicate of already-delivered frame
 	}
@@ -441,10 +458,11 @@ func (s *Stream) deliver(seq uint32, payload []byte, isFin bool) (ack bool) {
 		if s.reorderBytes+len(payload) > s.maxBufSize() {
 			return false // over budget; sender will retransmit
 		}
-		cp := make([]byte, len(payload))
+		cp := s.reorderGetLocked(len(payload))
 		copy(cp, payload)
 		s.reorder[seq] = cp
 		s.reorderBytes += len(payload)
+		s.conn.statReorder.Add(1)
 		s.maybeFastRetransmitLocked()
 		return true
 	}
@@ -570,9 +588,38 @@ func (s *Stream) drainReorderLocked() {
 		s.ringWrite(data)
 		delete(s.reorder, s.readSeq)
 		s.reorderBytes -= len(data)
+		s.reorderPutLocked(data)
 		s.readSeq++
 		s.readCond.Broadcast()
 	}
+}
+
+// reorderGetLocked returns a length-n buffer for an out-of-order frame copy,
+// reusing a pooled one when available. Under a loss burst the reorder path
+// runs once per buffered frame, and per-frame allocations here feed the GC
+// exactly when the receiver can least afford pauses — a stalled receiver
+// drops more packets, which buffers more frames, which allocates more.
+// Caller holds readMu.
+func (s *Stream) reorderGetLocked(n int) []byte {
+	if n <= s.conn.cfg.maxPayload {
+		if l := len(s.reorderPool); l > 0 {
+			buf := s.reorderPool[l-1]
+			s.reorderPool[l-1] = nil
+			s.reorderPool = s.reorderPool[:l-1]
+			return buf[:n]
+		}
+		return make([]byte, n, s.conn.cfg.maxPayload)
+	}
+	return make([]byte, n) // over-size: not poolable, GC-owned
+}
+
+// reorderPutLocked returns a drained reorder buffer to the pool. Caller
+// holds readMu.
+func (s *Stream) reorderPutLocked(buf []byte) {
+	if cap(buf) != s.conn.cfg.maxPayload {
+		return // the over-size fallback from reorderGetLocked
+	}
+	s.reorderPool = append(s.reorderPool, buf[:0:s.conn.cfg.maxPayload])
 }
 
 // --- ring buffer (all-or-nothing, growable) ---
@@ -631,15 +678,28 @@ func (s *Stream) maybeGrowLocked() {
 	s.grantLocked(newCap - oldCap)
 }
 
-// maybeFastRetransmitLocked asks the peer to immediately resend the next
-// expected frame (s.readSeq) once we have reasonable evidence it's actually
-// lost rather than merely reordered: a second out-of-order arrival for the
-// same still-missing sequence, spaced at least one grace period after the
-// first. This recovers a lost DATA frame in a small multiple of the RTT
-// instead of waiting for the fixed retransmit timeout — the same idea as TCP
-// fast-retransmit / QUIC's ACK-driven loss detection — while the grace
-// period keeps ordinary packet reordering from being mistaken for loss and
-// triggering a wasteful duplicate resend. Caller holds readMu.
+// maxNackSeqsPerFire bounds how many missing frames one NACK asks for.
+// Large enough to cover a burst hole (e.g. a whole lost GSO super-packet is
+// only ~7 frames), small enough that a mistaken NACK volley (frames that
+// were merely late, not lost) costs little duplicate traffic.
+const maxNackSeqsPerFire = 64
+
+// maybeFastRetransmitLocked asks the peer to immediately resend frames we
+// have reasonable evidence are actually lost rather than merely reordered:
+// the head gap (s.readSeq) has persisted for a grace period since first
+// observed, re-confirmed by this latest out-of-order arrival. This recovers
+// lost DATA frames in a small multiple of the RTT instead of waiting for
+// the retransmit timeout — the same idea as TCP fast-retransmit / QUIC's
+// ACK-driven loss detection — while the grace period keeps ordinary packet
+// reordering from being mistaken for loss.
+//
+// The NACK carries EVERY missing seq up to maxSeenSeq (bounded by
+// maxNackSeqsPerFire), not just the head gap: loss is frequently bursty —
+// correlated drops, and with GSO an entire super-packet of consecutive
+// frames vanishes as a unit — and asking for one frame per grace period
+// would heal an N-frame hole serially in N round trips, stalling delivery
+// far longer than the single round trip the whole volley needs. Caller
+// holds readMu.
 func (s *Stream) maybeFastRetransmitLocked() {
 	now := time.Now()
 	grace := s.conn.currentRTO() / reorderGraceFraction
@@ -655,7 +715,21 @@ func (s *Stream) maybeFastRetransmitLocked() {
 		return
 	}
 	s.lastNackAt = now
-	s.conn.sendControlFrame(frameNack, s.id, s.readSeq)
+
+	gaps := s.nackScratch[:0]
+	max := maxNackSeqsPerFire
+	if lim := maxAckSeqsPerFrame(s.conn.cfg.maxPayload); max > lim {
+		max = lim
+	}
+	for seq := s.readSeq; seq <= s.maxSeenSeq && len(gaps) < max; seq++ {
+		if _, buffered := s.reorder[seq]; !buffered {
+			gaps = append(gaps, seq)
+		}
+	}
+	s.nackScratch = gaps
+	if len(gaps) > 0 {
+		s.conn.sendNackFrame(s.id, gaps)
+	}
 }
 
 // grantLocked increases the cumulative offset granted to the peer by delta

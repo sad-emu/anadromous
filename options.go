@@ -31,6 +31,8 @@ type config struct {
 	keepAlive       time.Duration
 	retransmitTmout time.Duration
 	bindDevice      string // SO_BINDTODEVICE interface name, empty = unbound
+	enableGSO       bool
+	maxInFlight     int // per-stream cap on sent-but-unACKed bytes
 	socketOpts      func(*unet.Socket)
 }
 
@@ -45,7 +47,24 @@ func defaultConfig() config {
 		handshakeTimout: defaultHandshakeTimout,
 		keepAlive:       defaultKeepAlive,
 		retransmitTmout: defaultRetransmitTimeout,
+		enableGSO:       true,
 	}
+}
+
+// effectiveMaxInFlight resolves the per-stream cap on sent-but-unACKed
+// bytes. An explicit WithMaxBytesInFlight wins; otherwise the cap is twice
+// the configured UDP socket receive buffer — the kernel grants sockets 2×
+// their SO_RCVBUF request, so this is exactly what a peer provisioned like
+// us can absorb with a completely stalled reader. Benchmarking bears the
+// coupling out: at 2×recvBufSize the loopback benchmark is drop-free and
+// stable, while even 4× reliably tips into the drop→retransmit collapse
+// documented on WithMaxBytesInFlight. Raise WithRecvBufferSize (and
+// net.core.rmem_max, on both ends) to raise this cap for high-BDP links.
+func (c *config) effectiveMaxInFlight() int {
+	if c.maxInFlight > 0 {
+		return c.maxInFlight
+	}
+	return 2 * c.recvBufSize
 }
 
 // maxDatagram returns the full datagram buffer size for this config.
@@ -131,6 +150,42 @@ func WithBindToDevice(ifname string) Option {
 // retransmissions.
 func WithRetransmitTimeout(d time.Duration) Option {
 	return func(c *config) { c.retransmitTmout = d }
+}
+
+// WithMaxBytesInFlight caps how many sent-but-unacknowledged bytes a stream
+// may have outstanding; Write blocks once the cap is reached. Size it to the
+// link's bandwidth-delay product (bytes/sec × round-trip seconds), the same
+// way the stream buffer is sized — the cap is additionally bounded above by
+// the stream buffer size. When unset it defaults to streamBufSize/8 clamped
+// to [8MB, 64MB] — see config.effectiveMaxInFlight.
+//
+// This cap is the protocol's only brake, so don't set it huge "to be safe":
+// with no congestion control by design, everything outstanding is re-blasted
+// every retransmit interval when things go wrong. If the cap is much larger
+// than what the path and receiver can actually absorb, one drop burst (e.g.
+// the receiver's UDP socket buffer overflowing) snowballs — retransmits of
+// a huge window add more load, causing more drops — into a persistent
+// collapse that a BDP-sized cap makes self-limiting instead.
+func WithMaxBytesInFlight(n int) Option {
+	return func(c *config) { c.maxInFlight = n }
+}
+
+// WithGSO controls UDP generic segmentation offload on the send path: up to
+// seven full-size DATA frames are packed into one sendmmsg message that the
+// kernel segments into individual datagrams, cutting per-frame send cost —
+// and, symmetrically, a GRO-capable receiver ingests the burst as one
+// coalesced buffer. On by default (silently disabled on kernels without
+// UDP_SEGMENT/UDP_GRO support, pre-4.18/5.0): benchmarked on loopback it
+// both raises throughput (~6GB/s vs ~4.5GB/s unpacked) and stabilizes it,
+// because the receiver does a fraction of the per-datagram work and so
+// stalls — whose packet drops snowball on a protocol with no congestion
+// control — become rarer. Note the burst-vs-receiver-buffer interaction
+// documented on WithMaxBytesInFlight applies regardless of this setting;
+// the in-flight cap is what bounds bursts, not GSO. Receivers need no
+// matching option — the receive side always accepts both packed and
+// unpacked senders.
+func WithGSO(enabled bool) Option {
+	return func(c *config) { c.enableGSO = enabled }
 }
 
 // WithSocketOptions provides an escape hatch for setting arbitrary unet socket options.

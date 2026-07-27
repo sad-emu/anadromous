@@ -41,7 +41,21 @@ type Connection struct {
 	sendMu   sync.Mutex
 	sendBufs [][]byte // pre-allocated datagram buffers
 	sendLens []int    // actual length written into each sendBuf
-	sendN    int      // number of pending datagrams in current batch
+	sendN    int      // number of pending messages in current batch
+	iovsPer  int      // iovecs per message slot (2*gsoMaxFrames, or 2 without GSO)
+
+	// UDP GSO (UDP_SEGMENT) packing state, guarded by sendMu. When the
+	// socket option is supported, up to gsoMaxFrames full-size DATA frames
+	// are packed into one sendmmsg message that the kernel segments into
+	// individual datagrams at gsoSize boundaries — amortizing the
+	// per-message kernel cost, which profiling shows dominates (>60% CPU)
+	// at high throughput. gsoMaxFrames < 2 means GSO is off and every
+	// message carries exactly one frame, as before.
+	gsoSize      int // segment size == cfg.maxDatagram()
+	gsoMaxFrames int
+	packIdx      int // message slot currently being packed, -1 when none
+	packFrames   int // frames packed into that slot so far
+	packBytes    int // total bytes packed into that slot so far
 
 	// stream management
 	streamMu      sync.RWMutex
@@ -101,6 +115,9 @@ type Connection struct {
 
 	// statResends counts frames retransmitted over the connection lifetime.
 	statResends atomic.Int64
+	// statReorder counts frames that arrived out of order (buffered in a
+	// stream's reorder map rather than delivered directly).
+	statReorder atomic.Int64
 
 	// role: true if this side initiated the connection (client)
 	isClient bool
@@ -144,35 +161,82 @@ func newConnection(sock *unet.Socket, fd int, remote unet.Address, connID uint64
 
 	maxDatagram := cfg.maxDatagram()
 
+	// Try to enable UDP GSO: with the socket-level UDP_SEGMENT option set to
+	// one datagram, a message of K concatenated full-size frames is
+	// segmented by the kernel into K datagrams, so the per-message send
+	// cost is amortized across K frames. Messages smaller than one segment
+	// (all the control frames) pass through unchanged. The wire format is
+	// unaffected — the peer receives ordinary individual datagrams and
+	// needs no GSO support of its own.
+	c.gsoMaxFrames = 1
+	const maxGSOBytes = 60000 // stay under the 64KB IP packet limit
+	if frames := maxGSOBytes / maxDatagram; cfg.enableGSO && frames >= 2 {
+		// Raw setsockopt rather than sock.SetOptGso: the unet helper closes
+		// the socket outright when the option is unsupported (pre-4.18
+		// kernel), whereas an unsupported option here should just mean
+		// falling back to one frame per message.
+		if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_UDP, unet.UDP_SEGMENT, maxDatagram); err == nil {
+			c.gsoSize = maxDatagram
+			c.gsoMaxFrames = frames
+			if c.gsoMaxFrames > 8 {
+				c.gsoMaxFrames = 8
+			}
+		}
+	}
+	// Try to enable UDP GRO, the receive-side twin: the kernel hands over a
+	// burst of equal-size datagrams from the same sender as ONE coalesced
+	// buffer, so a GSO burst from the peer costs one recvmmsg slot instead
+	// of one per datagram. Frames are self-describing (header carries the
+	// payload length), so the coalesced buffer is simply parsed as a frame
+	// sequence — see handleDatagramLocked — and no cmsg plumbing is needed.
+	// Without GRO each buffer holds exactly one frame and the same parse
+	// loop runs a single iteration. GSO without GRO on the receiver is a
+	// LOSS, not a wash: the peer's bursts arrive as small back-to-back
+	// wakeups that shrink the receiver's effective recvmmsg batch size, so
+	// only pack frames when the coalescing side is on too.
+	recvBufLen := maxDatagram
+	const udpGRO = 104 // UDP_GRO socket option (Linux 5.0+)
+	if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_UDP, udpGRO, 1); err == nil {
+		recvBufLen = 65536
+	} else {
+		c.gsoSize = 0
+		c.gsoMaxFrames = 1
+	}
+	c.packIdx = -1
+	c.iovsPer = 2 * c.gsoMaxFrames
+
 	// Set up batched receive endpoint.
 	c.sReadIdsToAck = make(map[uint32][]uint32)
 	c.recvBufs = make([][]byte, cfg.batchSize)
 	recvIdx := 0
 	c.recvEP.SetupVectors(cfg.batchSize, 1, func(iov []syscall.Iovec) {
-		b := make([]byte, maxDatagram)
+		b := make([]byte, recvBufLen)
 		c.recvBufs[recvIdx] = b
 		iov[0].Base = &b[0]
-		iov[0].Len = uint64(maxDatagram)
+		iov[0].Len = uint64(recvBufLen)
 		recvIdx++
 	}, nil) // connected socket, no name needed
 
-	// Set up batched send endpoint. Two iovecs per message: iov[0] is the
-	// slot's own buffer, used either for a fully-encoded frame (header and
-	// payload combined, for the low-traffic control frame types) or just the
-	// header (for DATA/FIN/RESET, whose payload lives in the retransmit
-	// arena — see commitSendSlotZeroCopy); iov[1] is unused (Len 0) in the
-	// former case and points directly at the arena buffer in the latter, so
-	// that payload is never copied into a send buffer at all.
+	// Set up batched send endpoint. Each message slot has iovsPer iovecs
+	// used in (header, payload) pairs: iov[0] is the slot's own buffer,
+	// holding either a fully-encoded frame (header and payload combined,
+	// for the low-traffic control frame types) or one or more 13-byte
+	// headers (for DATA/FIN/RESET, whose payloads live in the retransmit
+	// arena); each odd iovec points directly at an arena payload so bulk
+	// data is never copied into a send buffer at all (see
+	// commitSendSlotZeroCopy and queueFrameGSOLocked).
 	c.sendBufs = make([][]byte, cfg.batchSize)
 	c.sendLens = make([]int, cfg.batchSize)
 	sendIdx := 0
-	c.sendEP.SetupVectors(cfg.batchSize, 2, func(iov []syscall.Iovec) {
+	c.sendEP.SetupVectors(cfg.batchSize, c.iovsPer, func(iov []syscall.Iovec) {
 		b := make([]byte, maxDatagram)
 		c.sendBufs[sendIdx] = b
 		iov[0].Base = &b[0]
 		iov[0].Len = 0 // set to actual frame size on each send
-		iov[1].Base = nil
-		iov[1].Len = 0 // set per-send when the zero-copy path is used
+		for i := 1; i < len(iov); i++ {
+			iov[i].Base = nil
+			iov[i].Len = 0
+		}
 		sendIdx++
 	}, nil) // connected socket, no name needed
 
@@ -307,6 +371,12 @@ func (c *Connection) Close() error {
 // after queuing several) must call flushSend().
 func (c *Connection) sendDataFrame(streamID, seq uint32, payload []byte) error {
 	data := c.retransmit.add(frameData, streamID, seq, payload)
+	if c.gsoMaxFrames >= 2 {
+		c.sendMu.Lock()
+		err := c.queueFrameGSOLocked(frameData, streamID, seq, data)
+		c.sendMu.Unlock()
+		return err
+	}
 	buf, idx, err := c.acquireSendSlot()
 	if err != nil {
 		return err
@@ -364,21 +434,64 @@ func (c *Connection) sendControlFrame(ftype uint8, streamID, seq uint32) error {
 // sendACKFrame sends an ACK frame acknowledging receipt of a set of data
 // frames immediately. len(seqs) must not exceed maxAckSeqsPerFrame.
 func (c *Connection) sendACKFrame(streamID uint32, seqs []uint32) error {
+	if err := c.queueACKFrame(streamID, seqs); err != nil {
+		return err
+	}
+	return c.flushSend()
+}
+
+// sendNackFrame asks the peer to immediately resend the listed frames of a
+// stream (fast retransmit). Same seq-list wire format as ACK.
+// len(seqs) must not exceed maxAckSeqsPerFrame.
+func (c *Connection) sendNackFrame(streamID uint32, seqs []uint32) error {
 	buf, idx, err := c.acquireSendSlot()
 	if err != nil {
 		return err
 	}
-	n := encodeAckFrame(buf, streamID, seqs)
+	n := encodeSeqListFrame(buf, frameNack, streamID, seqs)
 	if err := c.commitSendSlot(idx, n); err != nil {
 		return err
 	}
 	return c.flushSend()
 }
 
-// acquireSendSlot reserves a slot in the send batch. If the batch is full,
-// it flushes first.
+// queueResendFrame queues one pending frame for retransmission, zero-copy
+// from the retransmit arena and GSO-packed with other resends when packing
+// is on. Callers flush after queuing a batch.
+func (c *Connection) queueResendFrame(e retransmitEntry) error {
+	if c.gsoMaxFrames >= 2 {
+		c.sendMu.Lock()
+		err := c.queueFrameGSOLocked(e.ftype, e.streamID, e.seq, e.data)
+		c.sendMu.Unlock()
+		return err
+	}
+	buf, idx, err := c.acquireSendSlot()
+	if err != nil {
+		return err
+	}
+	encodeHeader(buf, e.ftype, e.streamID, e.seq, uint32(len(e.data)))
+	return c.commitSendSlotZeroCopy(idx, e.data)
+}
+
+// queueACKFrame queues an ACK frame without flushing, so a flush of many
+// ACK frames (one per stream per receive batch — see
+// flushPendingAcksLocked) costs one sendmmsg instead of one per frame.
+// len(seqs) must not exceed maxAckSeqsPerFrame.
+func (c *Connection) queueACKFrame(streamID uint32, seqs []uint32) error {
+	buf, idx, err := c.acquireSendSlot()
+	if err != nil {
+		return err
+	}
+	n := encodeAckFrame(buf, streamID, seqs)
+	return c.commitSendSlot(idx, n)
+}
+
+// acquireSendSlot reserves a message slot in the send batch. If the batch is
+// full, it flushes first. Any GSO message being packed is closed so this
+// frame gets its own slot after it, preserving queue order.
 func (c *Connection) acquireSendSlot() (buf []byte, idx int, err error) {
 	c.sendMu.Lock()
+	c.closePackLocked()
 	if c.sendN >= c.cfg.batchSize {
 		err = c.flushSendLocked()
 		if err != nil {
@@ -396,10 +509,9 @@ func (c *Connection) acquireSendSlot() (buf []byte, idx int, err error) {
 // only if the batch is now full. Caller holds sendMu (acquired by
 // acquireSendSlot) and this releases it.
 func (c *Connection) commitSendSlot(idx int, n int) error {
-	base := idx * 2
+	base := idx * c.iovsPer
 	c.sendEP.Iov[base].Len = uint64(n)
-	c.sendEP.Iov[base+1].Base = nil
-	c.sendEP.Iov[base+1].Len = 0
+	c.sendEP.Hdrs[idx].Iovlen = 1
 	c.sendEP.Hdrs[idx].NTransferred = 0
 	c.sendLens[idx] = n
 	c.sendN = idx + 1
@@ -423,7 +535,7 @@ func (c *Connection) commitSendSlot(idx int, n int) error {
 // referencing it has already been handed to the kernel. Caller holds sendMu
 // (acquired by acquireSendSlot) and this releases it.
 func (c *Connection) commitSendSlotZeroCopy(idx int, payload []byte) error {
-	base := idx * 2
+	base := idx * c.iovsPer
 	c.sendEP.Iov[base].Len = uint64(frameHeaderSize)
 	if len(payload) > 0 {
 		c.sendEP.Iov[base+1].Base = &payload[0]
@@ -431,6 +543,7 @@ func (c *Connection) commitSendSlotZeroCopy(idx int, payload []byte) error {
 		c.sendEP.Iov[base+1].Base = nil
 	}
 	c.sendEP.Iov[base+1].Len = uint64(len(payload))
+	c.sendEP.Hdrs[idx].Iovlen = 2
 	c.sendEP.Hdrs[idx].NTransferred = 0
 	c.sendLens[idx] = frameHeaderSize + len(payload)
 	c.sendN = idx + 1
@@ -443,6 +556,66 @@ func (c *Connection) commitSendSlotZeroCopy(idx int, payload []byte) error {
 	return err
 }
 
+// queueFrameGSOLocked queues a reliable frame into the GSO message currently
+// being packed, opening a new one if needed. The message accumulates
+// (header, payload) iovec pairs — payloads referenced zero-copy from the
+// retransmit arena — and is closed when it reaches gsoMaxFrames or when a
+// short (non-full) frame arrives, since GSO requires every segment except
+// the last to be exactly gsoSize. Caller holds sendMu; only call when
+// gsoMaxFrames >= 2.
+func (c *Connection) queueFrameGSOLocked(ftype uint8, streamID, seq uint32, payload []byte) error {
+	if c.packIdx < 0 {
+		if c.sendN >= c.cfg.batchSize {
+			if err := c.flushSendLocked(); err != nil {
+				return err
+			}
+		}
+		// Reserve the slot up front so interleaved single-frame sends and
+		// flushes account for it correctly.
+		c.packIdx = c.sendN
+		c.sendN++
+		c.packFrames = 0
+		c.packBytes = 0
+	}
+	idx := c.packIdx
+	hdr := c.sendBufs[idx][c.packFrames*frameHeaderSize : (c.packFrames+1)*frameHeaderSize]
+	encodeHeader(hdr, ftype, streamID, seq, uint32(len(payload)))
+	base := idx*c.iovsPer + 2*c.packFrames
+	c.sendEP.Iov[base].Base = &hdr[0]
+	c.sendEP.Iov[base].Len = uint64(frameHeaderSize)
+	if len(payload) > 0 {
+		c.sendEP.Iov[base+1].Base = &payload[0]
+	} else {
+		c.sendEP.Iov[base+1].Base = nil
+	}
+	c.sendEP.Iov[base+1].Len = uint64(len(payload))
+	c.packFrames++
+	c.packBytes += frameHeaderSize + len(payload)
+
+	full := frameHeaderSize+len(payload) >= c.gsoSize
+	if c.packFrames >= c.gsoMaxFrames || !full {
+		c.closePackLocked()
+		if c.sendN >= c.cfg.batchSize {
+			return c.flushSendLocked()
+		}
+	}
+	return nil
+}
+
+// closePackLocked finalizes the GSO message being packed, if any: its iovec
+// count and length are stamped so flushSendLocked can hand it to the kernel.
+// Caller holds sendMu.
+func (c *Connection) closePackLocked() {
+	if c.packIdx < 0 {
+		return
+	}
+	idx := c.packIdx
+	c.sendEP.Hdrs[idx].Iovlen = uint64(2 * c.packFrames)
+	c.sendEP.Hdrs[idx].NTransferred = 0
+	c.sendLens[idx] = c.packBytes
+	c.packIdx = -1
+}
+
 // flushSend pushes any queued-but-unflushed datagrams to the wire in a
 // single sendmmsg call.
 func (c *Connection) flushSend() error {
@@ -452,8 +625,9 @@ func (c *Connection) flushSend() error {
 	return err
 }
 
-// flushSendLocked sends all queued datagrams via sendmmsg. Caller holds sendMu.
+// flushSendLocked sends all queued messages via sendmmsg. Caller holds sendMu.
 func (c *Connection) flushSendLocked() error {
+	c.closePackLocked()
 	if c.sendN == 0 {
 		return nil
 	}
@@ -465,15 +639,8 @@ func (c *Connection) flushSendLocked() error {
 	n := c.sendN
 	_, errno := unet.SendMMsgRetry(uintptr(c.fd), c.sendEP.Hdrs[:n], n)
 	c.sendN = 0
-
-	// Reset iov lens for next batch.
-	for i := 0; i < n; i++ {
-		base := i * 2
-		c.sendEP.Iov[base].Len = uint64(c.cfg.maxDatagram())
-		c.sendEP.Iov[base+1].Base = nil
-		c.sendEP.Iov[base+1].Len = 0
-		c.sendEP.Hdrs[i].NTransferred = 0
-	}
+	// No per-iovec reset is needed: every path that claims a slot stamps
+	// its Iovlen, lengths, and iovec pointers before the next flush.
 
 	// The batch (and every zero-copy arena pointer in it) has now been
 	// handed to the kernel, so any arena buffers freed by ACKs/purges while
@@ -509,12 +676,9 @@ func (c *Connection) retransmitLoop() {
 		resend := c.retransmit.due(c.currentRTO())
 
 		for _, e := range resend {
-			buf, idx, err := c.acquireSendSlot()
-			if err != nil {
+			if c.queueResendFrame(e) != nil {
 				break // connection is going away
 			}
-			encodeHeader(buf, e.ftype, e.streamID, e.seq, uint32(len(e.data)))
-			c.commitSendSlotZeroCopy(idx, e.data)
 		}
 		if len(resend) > 0 {
 			c.statResends.Add(int64(len(resend)))
@@ -589,7 +753,7 @@ func (c *Connection) readLoop() {
 		// Reset iov lens for receive.
 		for i := 0; i < c.cfg.batchSize; i++ {
 			c.recvEP.Iov[i].Base = &c.recvBufs[i][0]
-			c.recvEP.Iov[i].Len = uint64(c.cfg.maxDatagram())
+			c.recvEP.Iov[i].Len = uint64(len(c.recvBufs[i]))
 			c.recvEP.Hdrs[i].NTransferred = 0
 		}
 
@@ -635,14 +799,26 @@ func (c *Connection) handleDatagram(buf []byte) {
 	c.recvMu.Unlock()
 }
 
-// handleDatagramLocked processes a single received datagram. Caller holds
-// recvMu.
+// handleDatagramLocked processes a received buffer. With UDP_GRO active the
+// kernel may deliver several coalesced datagrams in one buffer, so this
+// parses it as a sequence of frames — each frame's header carries its
+// payload length, so consecutive frames are self-delimiting; without GRO
+// the buffer holds exactly one frame and the loop runs once. A malformed
+// frame discards the remainder of the buffer (frame boundaries after it
+// can't be trusted). Caller holds recvMu.
 func (c *Connection) handleDatagramLocked(buf []byte) {
-	f, err := decodeFrame(buf)
-	if err != nil {
-		return // discard malformed frames
+	for len(buf) >= frameHeaderSize {
+		f, err := decodeFrame(buf)
+		if err != nil {
+			return // discard malformed remainder
+		}
+		c.dispatchFrameLocked(f)
+		buf = buf[frameHeaderSize+int(f.length):]
 	}
+}
 
+// dispatchFrameLocked routes one decoded frame. Caller holds recvMu.
+func (c *Connection) dispatchFrameLocked(f frame) {
 	// Any successfully decoded frame from the peer is proof of life: reset
 	// the idle/keepalive counter here rather than only on framePong. Ping is
 	// a tiny, unreliable, single-packet control frame like any other, so
@@ -702,6 +878,7 @@ func (c *Connection) flushPendingAcks() {
 // nothing; removeStream deletes a stream's slot when the stream goes away.
 func (c *Connection) flushPendingAcksLocked() {
 	maxAcks := maxAckSeqsPerFrame(c.cfg.maxPayload)
+	queued := false
 	for streamID, seqs := range c.sReadIdsToAck {
 		if len(seqs) == 0 {
 			continue
@@ -712,10 +889,14 @@ func (c *Connection) flushPendingAcksLocked() {
 			if n > maxAcks {
 				n = maxAcks
 			}
-			c.sendACKFrame(streamID, rest[:n])
+			c.queueACKFrame(streamID, rest[:n])
 			rest = rest[n:]
 		}
+		queued = true
 		c.sReadIdsToAck[streamID] = seqs[:0]
+	}
+	if queued {
+		c.flushSend()
 	}
 }
 
@@ -891,23 +1072,31 @@ func (c *Connection) handleACK(f frame) {
 	}
 }
 
-// handleNack immediately resends the single (stream, seq) frame the peer is
-// missing, bypassing the fixed-interval retransmit timer. This is the
-// fast-retransmit path: the peer only sends a NACK once it has direct
-// evidence of the gap (a later frame already arrived), so recovery happens
-// in about one RTT instead of waiting out the timer.
+// handleNack immediately resends the (stream, seq...) frames the peer says
+// are missing, bypassing the retransmit timer. This is the fast-retransmit
+// path: the peer only NACKs once it has direct evidence of loss (later
+// frames arrived and the gap persisted past the reorder grace), so recovery
+// happens in about one RTT instead of waiting out the timer. Seqs that are
+// already acknowledged or unknown are silently skipped.
 func (c *Connection) handleNack(f frame) {
-	e, ok := c.retransmit.getForResend(f.streamID, f.seq)
-	if !ok {
-		return // already acknowledged, or a stale/unknown NACK
-	}
-	buf, idx, err := c.acquireSendSlot()
+	seqs, err := decodeAckFrameInto(f, c.ackScratch)
 	if err != nil {
-		return
+		return // discard malformed NACK
 	}
-	encodeHeader(buf, e.ftype, e.streamID, e.seq, uint32(len(e.data)))
-	if c.commitSendSlotZeroCopy(idx, e.data) == nil {
-		c.statResends.Add(1)
+	c.ackScratch = seqs[:0] // retain capacity (shared with handleACK; both run under recvMu)
+	resent := 0
+	for _, seq := range seqs {
+		e, ok := c.retransmit.getForResend(f.streamID, seq)
+		if !ok {
+			continue
+		}
+		if c.queueResendFrame(e) != nil {
+			break // connection is going away
+		}
+		resent++
+	}
+	if resent > 0 {
+		c.statResends.Add(int64(resent))
 		c.flushSend()
 	}
 }
