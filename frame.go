@@ -23,7 +23,19 @@ const (
 	frameStreamReset  uint8 = 0x0B // Abort the sender's write side (like QUIC RESET_STREAM)
 	frameStopSending  uint8 = 0x0C // Ask the peer to stop sending (like QUIC STOP_SENDING)
 	frameNack         uint8 = 0x0D // Fast retransmit: resend specific (stream, seq...) frames now; seq-list payload like ACK
+	frameFEC          uint8 = 0x0E // Forward-error-correction parity over a group of DATA frames
 )
+
+// fecMetaLen is the per-frame metadata prefix present on DATA and FEC frame
+// payloads when FEC is enabled (see WithFEC): payload = [meta(4) | data].
+// For DATA frames meta is reserved (0). For FEC frames, seq carries the
+// group index k (covering DATA seqs [k*G, k*G+count)) and meta packs
+// count<<16 | xorOfMemberLengths; data is the XOR of the members' data,
+// each padded to the group's max length. Carrying the prefix on data frames
+// too (rather than only on parity) keeps full DATA and full parity frames
+// the same wire size, which the GSO packing path requires — the data cap
+// shrinks by 4 bytes instead.
+const fecMetaLen = 4
 
 // frameHeaderSize is the fixed size of a frame header on the wire.
 // Layout: [Type(1) | StreamID(4) | Sequence(4) | Length(4)] = 13 bytes

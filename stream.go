@@ -3,10 +3,26 @@
 package anadromous
 
 import (
+	"encoding/binary"
 	"io"
 	"sync"
 	"time"
 )
+
+// xorInto XORs src into dst (dst[i] ^= src[i] for i < len(src)); dst must
+// be at least as long as src. Word-at-a-time: this runs once per DATA frame
+// on the send path and per group member on FEC reconstruction, and a
+// byte-wise loop here measurably drags whole-connection throughput.
+func xorInto(dst, src []byte) {
+	i := 0
+	for ; i+8 <= len(src); i += 8 {
+		binary.LittleEndian.PutUint64(dst[i:],
+			binary.LittleEndian.Uint64(dst[i:])^binary.LittleEndian.Uint64(src[i:]))
+	}
+	for ; i < len(src); i++ {
+		dst[i] ^= src[i]
+	}
+}
 
 // reorderGraceFraction sets how long a gap must persist — evidenced by a
 // second out-of-order arrival for the same still-missing sequence, spaced at
@@ -61,20 +77,22 @@ type Stream struct {
 	readSeq        uint32            // next expected sequence number
 	reorder        map[uint32][]byte // out-of-order frames awaiting earlier seqs
 	reorderBytes   int
-	finRecvd       bool      // peer sent FIN
-	finSeq         uint32    // seq position of the peer's FIN (== count of data frames)
-	readErr        error     // sticky read result: io.EOF, ErrStreamReset, ErrStreamClosed
-	readCanceled   bool      // CancelRead called: incoming data is ACKed and discarded
-	reorderPool    [][]byte  // free list reusing reorder-copy buffers, capped at maxPayload each
-	grantPending   int       // bytes consumed by the app since the last window grant
-	peerOffset     int64     // absolute watermark we've most recently told the peer it may send up to
-	gapSeq         uint32    // readSeq value of the gap currently being tracked for fast retransmit
-	gapFirstSeenAt time.Time // when that gap was first observed
-	lastNackAt     time.Time // when a NACK was last sent for the current gap
-	maxSeenSeq     uint32    // highest data seq observed; bounds the NACK gap scan
-	nackScratch    []uint32  // reused gap-list buffer for NACK frames
-	createdAt      time.Time // stream creation time; bounds the ramp-up window
-	lastGrowAt     time.Time // when the ring last grew, paces the ramp-up
+	finRecvd       bool                        // peer sent FIN
+	finSeq         uint32                      // seq position of the peer's FIN (== count of data frames)
+	readErr        error                       // sticky read result: io.EOF, ErrStreamReset, ErrStreamClosed
+	readCanceled   bool                        // CancelRead called: incoming data is ACKed and discarded
+	reorderPool    [][]byte                    // free list reusing reorder-copy buffers, capped at maxPayload each
+	grantPending   int                         // bytes consumed by the app since the last window grant
+	peerOffset     int64                       // absolute watermark we've most recently told the peer it may send up to
+	gapSeq         uint32                      // readSeq value of the gap currently being tracked for fast retransmit
+	gapFirstSeenAt time.Time                   // when that gap was first observed
+	lastNackAt     time.Time                   // when a NACK was last sent for the current gap
+	maxSeenSeq     uint32                      // highest data seq observed; bounds the NACK gap scan
+	nackScratch    []uint32                    // reused gap-list buffer for NACK frames
+	createdAt      time.Time                   // stream creation time; bounds the ramp-up window
+	lastGrowAt     time.Time                   // when the ring last grew, paces the ramp-up
+	fecCache       map[uint32][]byte           // FEC receiver: recent delivered frames' data, for XOR reconstruction
+	fecPending     map[uint32]fecPendingParity // FEC receiver: parity frames awaiting more group members
 	readDeadline   time.Time
 
 	// write side — guarded by writeMu.
@@ -87,6 +105,13 @@ type Stream struct {
 	sentOffset    int64  // cumulative bytes sent so far
 	ackedBytes    int64  // cumulative bytes acknowledged so far (not necessarily contiguous — ACKs are selective)
 	writeDeadline time.Time
+
+	// FEC sender accumulator (writeMu): running XOR over the current
+	// parity group's data frames — see Stream.fecFoldLocked.
+	fecXor    []byte
+	fecMaxLen int
+	fecLenXor uint32
+	fecCount  int
 }
 
 func newStream(id uint32, conn *Connection, bufSize int) *Stream {
@@ -208,11 +233,11 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 	var dt deadlineTimer
 	defer dt.stop()
 
-	maxPayload := s.conn.cfg.maxPayload
+	maxChunk := s.conn.cfg.dataCap()
 	for len(p) > 0 {
 		chunkLen := len(p)
-		if chunkLen > maxPayload {
-			chunkLen = maxPayload
+		if chunkLen > maxChunk {
+			chunkLen = maxChunk
 		}
 		// Never overshoot the flow-control window (the receiver's ring is
 		// sized exactly to the credit it has granted, so an oversized frame
@@ -256,6 +281,7 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 			s.conn.flushSend()
 			return n, err
 		}
+		s.fecFoldLocked(seq, chunk)
 		n += len(chunk)
 		p = p[len(chunk):]
 	}
@@ -263,6 +289,44 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 		return n, ferr
 	}
 	return n, nil
+}
+
+// fecFoldLocked folds a just-sent DATA frame into the current parity
+// group's running XOR, emitting the parity frame when the group fills.
+// Caller holds writeMu.
+func (s *Stream) fecFoldLocked(seq uint32, chunk []byte) {
+	g := s.conn.cfg.fecGroup
+	if g <= 0 {
+		return
+	}
+	if s.fecXor == nil {
+		s.fecXor = make([]byte, s.conn.cfg.dataCap())
+	}
+	xorInto(s.fecXor, chunk)
+	if len(chunk) > s.fecMaxLen {
+		s.fecMaxLen = len(chunk)
+	}
+	s.fecLenXor ^= uint32(len(chunk))
+	s.fecCount++
+	if s.fecCount >= g {
+		s.emitFecLocked(seq)
+	}
+}
+
+// emitFecLocked sends the parity frame for the accumulated (possibly
+// partial) group ending at lastSeq and resets the accumulator. Caller holds
+// writeMu.
+func (s *Stream) emitFecLocked(lastSeq uint32) {
+	if s.fecCount == 0 {
+		return
+	}
+	first := lastSeq - uint32(s.fecCount-1)
+	group := first / uint32(s.conn.cfg.fecGroup)
+	s.conn.sendFecFrame(s.id, group, s.fecCount, int(s.fecLenXor), s.fecXor[:s.fecMaxLen])
+	for i := 0; i < s.fecMaxLen; i++ {
+		s.fecXor[i] = 0
+	}
+	s.fecMaxLen, s.fecLenXor, s.fecCount = 0, 0, 0
 }
 
 // setMaxSendOffset applies an absolute flow-control watermark received from
@@ -326,6 +390,12 @@ func (s *Stream) CloseWrite() error {
 	}
 	s.writeFIN = true
 	seq := s.writeSeq
+	// Flush the in-progress parity group (short groups are legal on the
+	// wire) so the stream's final frames get FEC protection too; the FIN
+	// itself is outside FEC (it's reliably retransmitted anyway).
+	if seq > 0 {
+		s.emitFecLocked(seq - 1)
+	}
 	s.writeCond.Broadcast()
 	s.writeMu.Unlock()
 
@@ -350,6 +420,8 @@ func (s *Stream) abortWriteLocked(code uint64, sendReset bool) {
 	s.writeErr = ErrStreamReset
 	s.writeFIN = true
 	seq := s.writeSeq
+	// Abandon the in-progress parity group — the peer no longer wants it.
+	s.fecMaxLen, s.fecLenXor, s.fecCount = 0, 0, 0
 	s.writeCond.Broadcast()
 	s.writeMu.Unlock()
 
@@ -381,11 +453,14 @@ func (s *Stream) CancelRead(code uint64) {
 	s.conn.sendControlFrame(frameStopSending, s.id, uint32(code))
 }
 
-// discardReadStateLocked drops buffered ring and reorder data. Caller holds readMu.
+// discardReadStateLocked drops buffered ring, reorder, and FEC data. Caller
+// holds readMu.
 func (s *Stream) discardReadStateLocked() {
 	s.readHead, s.readTail, s.readLen = 0, 0, 0
 	s.reorder = make(map[uint32][]byte)
 	s.reorderBytes = 0
+	s.fecCache = nil
+	s.fecPending = nil
 }
 
 // SetDeadline sets both read and write deadlines.
@@ -421,6 +496,12 @@ func (s *Stream) SetWriteDeadline(t time.Time) error {
 func (s *Stream) deliver(seq uint32, payload []byte, isFin bool) (ack bool) {
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
+	return s.deliverLocked(seq, payload, isFin)
+}
+
+// deliverLocked is deliver's body; FEC reconstruction (applyFec) calls it
+// directly to inject a rebuilt frame while already holding readMu.
+func (s *Stream) deliverLocked(seq uint32, payload []byte, isFin bool) (ack bool) {
 
 	if s.readCanceled || s.readErr != nil {
 		// Read side is done — discard, but acknowledge so the peer's
@@ -470,6 +551,7 @@ func (s *Stream) deliver(seq uint32, payload []byte, isFin bool) (ack bool) {
 		s.reorderBytes += len(payload)
 		s.conn.statReorder.Add(1)
 		s.maybeFastRetransmitLocked()
+		s.fecRetryLocked(seq)
 		return true
 	}
 
@@ -477,12 +559,18 @@ func (s *Stream) deliver(seq uint32, payload []byte, isFin bool) (ack bool) {
 	if !s.ringFitsLocked(len(payload)) && !s.growLocked(len(payload)) {
 		return false // no room; sender will retransmit
 	}
+	if s.conn.cfg.fecGroup > 0 {
+		cp := s.reorderGetLocked(len(payload))
+		copy(cp, payload)
+		s.fecStoreOwnedLocked(seq, cp)
+	}
 	s.ringWrite(payload)
 	s.readSeq++
 	s.drainReorderLocked()
 	s.maybeGrowLocked()
 	s.maybeEOFLocked()
 	s.readCond.Broadcast()
+	s.fecRetryLocked(seq)
 	return true
 }
 
@@ -594,10 +682,184 @@ func (s *Stream) drainReorderLocked() {
 		s.ringWrite(data)
 		delete(s.reorder, s.readSeq)
 		s.reorderBytes -= len(data)
-		s.reorderPutLocked(data)
+		if s.conn.cfg.fecGroup > 0 {
+			// Ownership transfer: the drained reorder buffer becomes the
+			// FEC cache entry for this seq — no copy.
+			s.fecStoreOwnedLocked(s.readSeq, data)
+		} else {
+			s.reorderPutLocked(data)
+		}
 		s.readSeq++
 		s.readCond.Broadcast()
 	}
+}
+
+// --- FEC receive side ---
+
+// fecStoreOwnedLocked records data (ownership transferred; must come from
+// the reorder pool sizing discipline) as the cached payload of a delivered
+// frame, for XOR reconstruction of groupmates. The cache is bounded: once
+// it exceeds several groups it evicts entries far behind readSeq — safe
+// because reconstruction only ever needs members of a group whose gap is
+// pinning readSeq in place, and those can't fall far behind it. Caller
+// holds readMu.
+func (s *Stream) fecStoreOwnedLocked(seq uint32, data []byte) {
+	g := s.conn.cfg.fecGroup
+	if s.fecCache == nil {
+		s.fecCache = make(map[uint32][]byte, 2*g)
+	}
+	if old, ok := s.fecCache[seq]; ok {
+		s.reorderPutLocked(old)
+	}
+	s.fecCache[seq] = data
+	if len(s.fecCache) > 8*g && s.readSeq > uint32(4*g) {
+		limit := s.readSeq - uint32(4*g)
+		for k, v := range s.fecCache {
+			if k < limit {
+				s.reorderPutLocked(v)
+				delete(s.fecCache, k)
+			}
+		}
+	}
+}
+
+// fecPendingParity is a buffered parity frame whose group couldn't be
+// reconstructed yet (two or more members still in flight, typically because
+// jitter delivered the parity ahead of its members). It's retried as each
+// member arrives — see the retry hook in deliverLocked.
+type fecPendingParity struct {
+	count  int
+	xorLen int
+	data   []byte // pooled copy
+}
+
+// Reconstruction outcomes for tryReconstructLocked.
+const (
+	fecUseless        = iota // group complete, unrecoverable, or parity invalid — parity can be dropped
+	fecRecovered             // the missing member was rebuilt and injected
+	fecPendingMembers        // >1 member still in flight — worth retrying later
+)
+
+// applyFec processes a parity frame covering DATA seqs
+// [group*G, group*G+count): if exactly one member is missing and every
+// other member's data is still available (in the reorder map or the FEC
+// cache), the missing frame is reconstructed by XOR and injected as if it
+// had arrived — zero-round-trip loss recovery. A parity whose group still
+// has several members in flight is buffered and retried as members arrive.
+// Returns whether a frame was recovered right now. Idempotent: on a
+// duplicate parity, nothing is missing anymore.
+func (s *Stream) applyFec(group uint32, count, xorLen int, xorData []byte) (recovered bool) {
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
+	if s.readCanceled || s.readErr != nil {
+		return false
+	}
+	switch s.tryReconstructLocked(group, count, xorLen, xorData) {
+	case fecRecovered:
+		return true
+	case fecPendingMembers:
+		if s.fecPending == nil {
+			s.fecPending = make(map[uint32]fecPendingParity)
+		}
+		if old, ok := s.fecPending[group]; ok {
+			s.reorderPutLocked(old.data)
+		} else if len(s.fecPending) >= 16 {
+			// Bound the buffer: evict the oldest group.
+			oldest := ^uint32(0)
+			for k := range s.fecPending {
+				if k < oldest {
+					oldest = k
+				}
+			}
+			s.reorderPutLocked(s.fecPending[oldest].data)
+			delete(s.fecPending, oldest)
+		}
+		cp := s.reorderGetLocked(len(xorData))
+		copy(cp, xorData)
+		s.fecPending[group] = fecPendingParity{count: count, xorLen: xorLen, data: cp}
+	}
+	return false
+}
+
+// fecRetryLocked re-attempts a buffered parity after a frame of its group
+// arrived. Caller holds readMu.
+func (s *Stream) fecRetryLocked(seq uint32) {
+	if len(s.fecPending) == 0 {
+		return
+	}
+	group := seq / uint32(s.conn.cfg.fecGroup)
+	p, ok := s.fecPending[group]
+	if !ok {
+		return
+	}
+	// Claim the entry before reconstructing so the injected frame's own
+	// pass through this hook can't double-process it.
+	delete(s.fecPending, group)
+	switch s.tryReconstructLocked(group, p.count, p.xorLen, p.data) {
+	case fecPendingMembers:
+		s.fecPending[group] = p // still waiting; put it back
+	case fecRecovered:
+		s.conn.statFecRecovered.Add(1)
+		s.reorderPutLocked(p.data)
+	default:
+		s.reorderPutLocked(p.data)
+	}
+}
+
+// tryReconstructLocked attempts the group reconstruction described on
+// applyFec. Caller holds readMu.
+func (s *Stream) tryReconstructLocked(group uint32, count, xorLen int, xorData []byte) int {
+	first := group * uint32(s.conn.cfg.fecGroup)
+	missingSeq := uint32(0)
+	missing := 0
+	for i := 0; i < count && missing < 2; i++ {
+		seq := first + uint32(i)
+		if _, ok := s.reorder[seq]; ok {
+			continue
+		}
+		if _, ok := s.fecCache[seq]; ok {
+			continue
+		}
+		if seq < s.readSeq {
+			return fecUseless // delivered but evicted from the cache — can't XOR
+		}
+		missingSeq = seq
+		missing++
+	}
+	if missing == 0 {
+		return fecUseless
+	}
+	if missing > 1 {
+		return fecPendingMembers
+	}
+
+	buf := s.reorderGetLocked(len(xorData))
+	copy(buf, xorData)
+	length := xorLen
+	for i := 0; i < count; i++ {
+		seq := first + uint32(i)
+		if seq == missingSeq {
+			continue
+		}
+		data, ok := s.reorder[seq]
+		if !ok {
+			data = s.fecCache[seq]
+		}
+		xorInto(buf, data)
+		length ^= len(data)
+	}
+	// A zero length would mean the missing member carried no data — only
+	// FIN/RESET occupy seqs without data, and those are reliably
+	// retransmitted, so don't guess; and an implausible length means the
+	// parity didn't match this group's reality (e.g. stale config) —
+	// discard rather than inject garbage.
+	if length <= 0 || length > len(xorData) {
+		s.reorderPutLocked(buf)
+		return fecUseless
+	}
+	s.deliverLocked(missingSeq, buf[:length], false)
+	s.reorderPutLocked(buf) // deliverLocked copied what it kept
+	return fecRecovered
 }
 
 // reorderGetLocked returns a length-n buffer for an out-of-order frame copy,

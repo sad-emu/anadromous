@@ -18,6 +18,7 @@ const (
 	defaultKeepAlive         = 10 * time.Second
 	defaultRetransmitTimeout = 300 * time.Millisecond
 	defaultHandshakeRetryIvl = 250 * time.Millisecond
+	defaultFECGroup          = 8 // see WithFEC
 )
 
 type config struct {
@@ -33,6 +34,7 @@ type config struct {
 	bindDevice      string // SO_BINDTODEVICE interface name, empty = unbound
 	enableGSO       bool
 	maxInFlight     int // per-stream cap on sent-but-unACKed bytes
+	fecGroup        int // DATA frames per FEC parity frame; 0 disables FEC
 	socketOpts      func(*unet.Socket)
 }
 
@@ -48,7 +50,17 @@ func defaultConfig() config {
 		keepAlive:       defaultKeepAlive,
 		retransmitTmout: defaultRetransmitTimeout,
 		enableGSO:       true,
+		fecGroup:        defaultFECGroup,
 	}
+}
+
+// dataCap returns the maximum data bytes per DATA frame: the payload budget
+// minus the FEC metadata prefix when FEC is on.
+func (c *config) dataCap() int {
+	if c.fecGroup > 0 {
+		return c.maxPayload - fecMetaLen
+	}
+	return c.maxPayload
 }
 
 // effectiveMaxInFlight resolves the per-stream cap on sent-but-unACKed
@@ -186,6 +198,36 @@ func WithMaxBytesInFlight(n int) Option {
 // unpacked senders.
 func WithGSO(enabled bool) Option {
 	return func(c *config) { c.enableGSO = enabled }
+}
+
+// WithFEC sets how many DATA frames are covered by each XOR parity frame
+// (forward error correction), or 0 to disable. Default 8 (12.5% bandwidth
+// overhead). With FEC, any single lost frame in a group is reconstructed by
+// the receiver the moment the group's parity arrives — zero round trips —
+// instead of costing a NACK or retransmit-timeout cycle. On a
+// high-loss/high-RTT link, recovery latency is what throughput dies of, so
+// trading spare bandwidth for it is exactly this protocol's design bargain
+// (known-capacity links, no congestion control). Two or more losses within
+// one group still fall back to NACK/timeout recovery; groups also flush,
+// possibly short, when the stream's write side closes.
+//
+// BOTH ENDS MUST USE THE SAME SETTING (like WithMaxDatagramSize): enabling
+// FEC adds a 4-byte metadata prefix to every DATA frame's wire payload, so
+// mismatched ends cannot parse each other's data frames at all. Group size
+// is clamped to [2, 32].
+func WithFEC(groupSize int) Option {
+	return func(c *config) {
+		switch {
+		case groupSize <= 0:
+			c.fecGroup = 0
+		case groupSize < 2:
+			c.fecGroup = 2
+		case groupSize > 32:
+			c.fecGroup = 32
+		default:
+			c.fecGroup = groupSize
+		}
+	}
 }
 
 // WithSocketOptions provides an escape hatch for setting arbitrary unet socket options.

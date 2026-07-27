@@ -12,6 +12,12 @@ import (
 // buffer), without any netem in the way — this measures the protocol's clean
 // -network ceiling and is the harness for CPU/alloc profiling.
 func benchPair(b *testing.B, extra ...Option) (*Stream, *Stream) {
+	return benchPairVia(b, nil, extra...)
+}
+
+// benchPairVia is benchPair but dials through an optional address rewriter
+// (used to interpose the lossy proxy between the endpoints).
+func benchPairVia(b *testing.B, via func(serverAddr string) string, extra ...Option) (*Stream, *Stream) {
 	b.Helper()
 	opts := append([]Option{
 		WithMaxDatagramSize(8500),
@@ -23,7 +29,11 @@ func benchPair(b *testing.B, extra ...Option) (*Stream, *Stream) {
 	}
 	b.Cleanup(func() { ln.Close() })
 
-	client, err := Dial(b.Context(), ln.Addr().String(), opts...)
+	dialAddr := ln.Addr().String()
+	if via != nil {
+		dialAddr = via(dialAddr)
+	}
+	client, err := Dial(b.Context(), dialAddr, opts...)
 	if err != nil {
 		b.Fatalf("Dial: %v", err)
 	}
@@ -69,6 +79,35 @@ func BenchmarkThroughputGSO(b *testing.B) {
 	benchThroughput(b, cs, ss)
 }
 
+// BenchmarkThroughputLossy pushes bulk data through the in-process hostile
+// network simulator (netem-like: 50ms±10ms each way, 10% loss, 5% dup —
+// see lossy_test.go), measuring poor-conditions throughput reproducibly and
+// without root. Expect two orders of magnitude below the clean benchmarks:
+// the profile's ~100ms RTT and loss-recovery latency dominate.
+func BenchmarkThroughputLossy(b *testing.B) {
+	cs, ss := lossyBenchPair(b)
+	benchThroughput(b, cs, ss)
+}
+
+// BenchmarkThroughputLossyNoFEC isolates FEC's contribution under loss.
+func BenchmarkThroughputLossyNoFEC(b *testing.B) {
+	cs, ss := lossyBenchPair(b, WithFEC(0))
+	benchThroughput(b, cs, ss)
+}
+
+func lossyBenchPair(b *testing.B, extra ...Option) (*Stream, *Stream) {
+	var proxy *lossyProxy
+	return benchPairVia(b, func(serverAddr string) string {
+		var err error
+		proxy, err = newLossyProxy(serverAddr, netemLikeProfile())
+		if err != nil {
+			b.Fatalf("newLossyProxy: %v", err)
+		}
+		b.Cleanup(proxy.Close)
+		return proxy.Addr()
+	}, extra...)
+}
+
 func benchThroughput(b *testing.B, cs, ss *Stream) {
 
 	const chunk = 64 * 1024
@@ -93,6 +132,7 @@ func benchThroughput(b *testing.B, cs, ss *Stream) {
 	if err := <-done; err != nil {
 		b.Fatalf("read side: %v", err)
 	}
-	b.Logf("sender resends=%d; receiver reorder=%d",
-		cs.conn.statResends.Load(), ss.conn.statReorder.Load())
+	b.Logf("sender resends=%d; receiver reorder=%d fec-recovered=%d",
+		cs.conn.statResends.Load(), ss.conn.statReorder.Load(),
+		ss.conn.statFecRecovered.Load())
 }

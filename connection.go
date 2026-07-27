@@ -56,6 +56,7 @@ type Connection struct {
 	packIdx      int // message slot currently being packed, -1 when none
 	packFrames   int // frames packed into that slot so far
 	packBytes    int // total bytes packed into that slot so far
+	packHdrOff   int // write cursor into the slot's header-strip buffer
 
 	// stream management
 	streamMu      sync.RWMutex
@@ -120,6 +121,9 @@ type Connection struct {
 	// statReorder counts frames that arrived out of order (buffered in a
 	// stream's reorder map rather than delivered directly).
 	statReorder atomic.Int64
+	// statFecRecovered counts frames reconstructed from FEC parity instead
+	// of retransmission.
+	statFecRecovered atomic.Int64
 
 	// role: true if this side initiated the connection (client)
 	isClient bool
@@ -366,6 +370,29 @@ func (c *Connection) Close() error {
 
 // --- send path (batched via sendmmsg) ---
 
+// frameHdrLen returns the wire header length for a frame type: the fixed
+// header, plus the FEC metadata prefix for DATA frames when FEC is on (the
+// prefix rides in the header iovec on the zero-copy paths, so the payload
+// can still be referenced from the retransmit arena unmodified).
+func (c *Connection) frameHdrLen(ftype uint8) int {
+	if ftype == frameData && c.cfg.fecGroup > 0 {
+		return frameHeaderSize + fecMetaLen
+	}
+	return frameHeaderSize
+}
+
+// writeFrameHdr writes a frame's header (and, for DATA under FEC, its
+// zeroed metadata prefix) into buf, returning the header length. The wire
+// length field covers the prefix plus dataLen.
+func (c *Connection) writeFrameHdr(buf []byte, ftype uint8, streamID, seq uint32, dataLen int) int {
+	hdrLen := c.frameHdrLen(ftype)
+	encodeHeader(buf, ftype, streamID, seq, uint32(hdrLen-frameHeaderSize+dataLen))
+	for i := frameHeaderSize; i < hdrLen; i++ {
+		buf[i] = 0
+	}
+	return hdrLen
+}
+
 // sendDataFrame queues a DATA frame and records it for retransmission until
 // acknowledged. payload is copied once into the retransmit arena (see
 // retransmitQueue.add) and referenced directly on the wire from there — see
@@ -384,8 +411,25 @@ func (c *Connection) sendDataFrame(streamID, seq uint32, payload []byte) error {
 	if err != nil {
 		return err
 	}
-	encodeHeader(buf, frameData, streamID, seq, uint32(len(data)))
-	return c.commitSendSlotZeroCopy(idx, data)
+	hdrLen := c.writeFrameHdr(buf, frameData, streamID, seq, len(data))
+	return c.commitSendSlotZeroCopy(idx, hdrLen, data)
+}
+
+// sendFecFrame sends a parity frame covering count DATA frames of group k
+// (seqs [k*G, k*G+count)). Unreliable by design: parity is itself
+// redundancy, so a lost parity frame just means that group has no FEC
+// protection and recovery falls back to NACK/timeout. xorData is copied
+// into the send slot's own buffer (it's the stream's live accumulator).
+func (c *Connection) sendFecFrame(streamID, group uint32, count, xorLen int, xorData []byte) error {
+	buf, idx, err := c.acquireSendSlot()
+	if err != nil {
+		return err
+	}
+	meta := uint32(count)<<16 | uint32(xorLen)
+	encodeHeader(buf, frameFEC, streamID, group, uint32(fecMetaLen+len(xorData)))
+	binary.BigEndian.PutUint32(buf[frameHeaderSize:], meta)
+	copy(buf[frameHeaderSize+fecMetaLen:], xorData)
+	return c.commitSendSlot(idx, frameHeaderSize+fecMetaLen+len(xorData))
 }
 
 // sendReliableFrame sends a frame immediately and retransmits it until the
@@ -399,8 +443,8 @@ func (c *Connection) sendReliableFrame(ftype uint8, streamID, seq uint32, payloa
 	if err != nil {
 		return err
 	}
-	encodeHeader(buf, ftype, streamID, seq, uint32(len(data)))
-	if err := c.commitSendSlotZeroCopy(idx, data); err != nil {
+	hdrLen := c.writeFrameHdr(buf, ftype, streamID, seq, len(data))
+	if err := c.commitSendSlotZeroCopy(idx, hdrLen, data); err != nil {
 		return err
 	}
 	return c.flushSend()
@@ -472,8 +516,8 @@ func (c *Connection) queueResendFrame(e retransmitEntry) error {
 	if err != nil {
 		return err
 	}
-	encodeHeader(buf, e.ftype, e.streamID, e.seq, uint32(len(e.data)))
-	return c.commitSendSlotZeroCopy(idx, e.data)
+	hdrLen := c.writeFrameHdr(buf, e.ftype, e.streamID, e.seq, len(e.data))
+	return c.commitSendSlotZeroCopy(idx, hdrLen, e.data)
 }
 
 // queueACKFrame queues an ACK frame without flushing, so a flush of many
@@ -537,9 +581,9 @@ func (c *Connection) commitSendSlot(idx int, n int) error {
 // function's caller (via flushSendLocked) only does after the batch
 // referencing it has already been handed to the kernel. Caller holds sendMu
 // (acquired by acquireSendSlot) and this releases it.
-func (c *Connection) commitSendSlotZeroCopy(idx int, payload []byte) error {
+func (c *Connection) commitSendSlotZeroCopy(idx, hdrLen int, payload []byte) error {
 	base := idx * c.iovsPer
-	c.sendEP.Iov[base].Len = uint64(frameHeaderSize)
+	c.sendEP.Iov[base].Len = uint64(hdrLen)
 	if len(payload) > 0 {
 		c.sendEP.Iov[base+1].Base = &payload[0]
 	} else {
@@ -548,7 +592,7 @@ func (c *Connection) commitSendSlotZeroCopy(idx int, payload []byte) error {
 	c.sendEP.Iov[base+1].Len = uint64(len(payload))
 	c.sendEP.Hdrs[idx].Iovlen = 2
 	c.sendEP.Hdrs[idx].NTransferred = 0
-	c.sendLens[idx] = frameHeaderSize + len(payload)
+	c.sendLens[idx] = hdrLen + len(payload)
 	c.sendN = idx + 1
 
 	var err error
@@ -579,13 +623,14 @@ func (c *Connection) queueFrameGSOLocked(ftype uint8, streamID, seq uint32, payl
 		c.sendN++
 		c.packFrames = 0
 		c.packBytes = 0
+		c.packHdrOff = 0
 	}
 	idx := c.packIdx
-	hdr := c.sendBufs[idx][c.packFrames*frameHeaderSize : (c.packFrames+1)*frameHeaderSize]
-	encodeHeader(hdr, ftype, streamID, seq, uint32(len(payload)))
+	hdrBuf := c.sendBufs[idx][c.packHdrOff:]
+	hdrLen := c.writeFrameHdr(hdrBuf, ftype, streamID, seq, len(payload))
 	base := idx*c.iovsPer + 2*c.packFrames
-	c.sendEP.Iov[base].Base = &hdr[0]
-	c.sendEP.Iov[base].Len = uint64(frameHeaderSize)
+	c.sendEP.Iov[base].Base = &hdrBuf[0]
+	c.sendEP.Iov[base].Len = uint64(hdrLen)
 	if len(payload) > 0 {
 		c.sendEP.Iov[base+1].Base = &payload[0]
 	} else {
@@ -593,9 +638,10 @@ func (c *Connection) queueFrameGSOLocked(ftype uint8, streamID, seq uint32, payl
 	}
 	c.sendEP.Iov[base+1].Len = uint64(len(payload))
 	c.packFrames++
-	c.packBytes += frameHeaderSize + len(payload)
+	c.packHdrOff += hdrLen
+	c.packBytes += hdrLen + len(payload)
 
-	full := frameHeaderSize+len(payload) >= c.gsoSize
+	full := hdrLen+len(payload) >= c.gsoSize
 	if c.packFrames >= c.gsoMaxFrames || !full {
 		c.closePackLocked()
 		if c.sendN >= c.cfg.batchSize {
@@ -834,7 +880,15 @@ func (c *Connection) dispatchFrameLocked(f frame) {
 
 	switch f.ftype {
 	case frameData:
+		if c.cfg.fecGroup > 0 {
+			if len(f.payload) < fecMetaLen {
+				return // malformed under FEC framing
+			}
+			f.payload = f.payload[fecMetaLen:] // strip the (reserved) FEC meta prefix
+		}
 		c.handleData(f)
+	case frameFEC:
+		c.handleFec(f)
 	case frameStreamFIN:
 		c.handleStreamFIN(f)
 	case frameStreamReset:
@@ -1023,6 +1077,32 @@ func (c *Connection) handleStreamFIN(f frame) {
 	}
 	s.deliver(f.seq, nil, true)
 	c.markAckDirty(f.streamID)
+}
+
+// handleFec routes a parity frame to its stream for possible zero-RTT loss
+// recovery (see Stream.applyFec). Parity for unknown/dead streams is
+// silently dropped — it's pure redundancy. Caller holds recvMu.
+func (c *Connection) handleFec(f frame) {
+	if c.cfg.fecGroup == 0 || len(f.payload) < fecMetaLen {
+		return
+	}
+	meta := binary.BigEndian.Uint32(f.payload[:fecMetaLen])
+	count := int(meta >> 16)
+	xorLen := int(meta & 0xffff)
+	if count <= 0 || count > c.cfg.fecGroup {
+		return // malformed or mismatched config
+	}
+	c.streamMu.RLock()
+	s := c.streams[f.streamID]
+	c.streamMu.RUnlock()
+	if s == nil {
+		return
+	}
+	if s.applyFec(f.seq, count, xorLen, f.payload[fecMetaLen:]) {
+		c.statFecRecovered.Add(1)
+		// The reconstruction advanced receive state: advertise it.
+		c.markAckDirty(f.streamID)
+	}
 }
 
 // handleStreamReset processes a peer's write-side abort. Resets are
