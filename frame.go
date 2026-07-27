@@ -89,17 +89,29 @@ func encodeAckFrame(buf []byte, streamID uint32, seqs []uint32) int {
 // decodeAckFrame extracts the acknowledged sequence numbers from a decoded
 // ACK frame's payload. The acknowledged stream is f.streamID.
 func decodeAckFrame(f frame) (seqs []uint32, err error) {
+	return decodeAckFrameInto(f, nil)
+}
+
+// decodeAckFrameInto is decodeAckFrame decoding into scratch's backing array
+// when it has the capacity, so a caller processing a steady flow of ACK
+// frames (Connection.handleACK) can reuse one buffer instead of allocating
+// per frame.
+func decodeAckFrameInto(f frame, scratch []uint32) (seqs []uint32, err error) {
 	if len(f.payload) < 4 {
 		err = errors.New("ack payload too small")
 		return
 	}
-	count := binary.BigEndian.Uint32(f.payload[0:4])
-	need := 4 + 4*int(count)
+	count := int(binary.BigEndian.Uint32(f.payload[0:4]))
+	need := 4 + 4*count
 	if len(f.payload) < need {
 		err = fmt.Errorf("ack payload truncated: have %d, need %d", len(f.payload), need)
 		return
 	}
-	seqs = make([]uint32, count)
+	if cap(scratch) >= count {
+		seqs = scratch[:count]
+	} else {
+		seqs = make([]uint32, count)
+	}
 	for i := range seqs {
 		off := 4 + 4*i
 		seqs[i] = binary.BigEndian.Uint32(f.payload[off : off+4])

@@ -32,6 +32,12 @@ import (
 // Besides DATA frames this also covers FIN and RESET frames, which occupy
 // the sequence position after the stream's last data frame and are ACKed
 // through the same per-stream sequence space.
+//
+// Entries are pooled (see retransmitQueue.getEntry/putEntry) and threaded
+// onto an intrusive doubly-linked list ordered by sentAt — every (re)send
+// moves the entry to the tail with sentAt=now, so the list head is always
+// the longest-outstanding frame and the due scan can stop at the first
+// not-yet-due entry instead of visiting every in-flight frame.
 type retransmitEntry struct {
 	ftype    uint8
 	streamID uint32
@@ -39,6 +45,8 @@ type retransmitEntry struct {
 	data     []byte // payload copy, owned by the arena — do not retain past removal
 	sentAt   time.Time
 	retries  int // resend attempts so far, diagnostic only
+
+	prev, next *retransmitEntry // send-order list links, guarded by retransmitQueue.mu
 }
 
 // retransmitArena is a self-managed free list of fixed-size buffers used to
@@ -104,8 +112,11 @@ func (a *retransmitArena) put(buf []byte) {
 type retransmitQueue struct {
 	mu          sync.Mutex
 	entries     map[uint64]*retransmitEntry
+	head, tail  *retransmitEntry // send-order list: head is the oldest sentAt
+	freeEntries []*retransmitEntry
 	arena       *retransmitArena
 	pendingFree [][]byte
+	scratch     []retransmitEntry // reused due() result; see due
 }
 
 func newRetransmitQueue(maxPayload int) *retransmitQueue {
@@ -119,22 +130,76 @@ func retransmitKey(streamID, seq uint32) uint64 {
 	return uint64(streamID)<<32 | uint64(seq)
 }
 
+// getEntry returns a pooled entry (unlinked, zeroed by the caller's
+// assignment) or allocates one when the pool is empty. Caller holds mu.
+func (q *retransmitQueue) getEntry() *retransmitEntry {
+	if n := len(q.freeEntries); n > 0 {
+		e := q.freeEntries[n-1]
+		q.freeEntries[n-1] = nil
+		q.freeEntries = q.freeEntries[:n-1]
+		return e
+	}
+	return &retransmitEntry{}
+}
+
+// pushTail appends an unlinked entry to the send-order list. Caller holds mu.
+func (q *retransmitQueue) pushTail(e *retransmitEntry) {
+	e.next = nil
+	e.prev = q.tail
+	if q.tail != nil {
+		q.tail.next = e
+	} else {
+		q.head = e
+	}
+	q.tail = e
+}
+
+// unlink removes an entry from the send-order list. Caller holds mu.
+func (q *retransmitQueue) unlink(e *retransmitEntry) {
+	if e.prev != nil {
+		e.prev.next = e.next
+	} else {
+		q.head = e.next
+	}
+	if e.next != nil {
+		e.next.prev = e.prev
+	} else {
+		q.tail = e.prev
+	}
+	e.prev, e.next = nil, nil
+}
+
+// removeLocked drops an entry entirely: out of the map and list, its payload
+// buffer deferred to pendingFree (see drainPendingFree for why it can't go
+// straight back to the arena), and the entry struct back to the pool.
+// Caller holds mu.
+func (q *retransmitQueue) removeLocked(key uint64, e *retransmitEntry) {
+	q.unlink(e)
+	q.pendingFree = append(q.pendingFree, e.data)
+	e.data = nil
+	q.freeEntries = append(q.freeEntries, e)
+	delete(q.entries, key)
+}
+
 // add records a sent frame as pending acknowledgement, copying payload into
 // an arena-owned buffer, and returns that buffer so the caller can send it
 // by reference (see Connection.commitSendSlotZeroCopy) — the payload is
 // written here once and not copied again for as long as it's outstanding,
 // including across retransmissions.
 func (q *retransmitQueue) add(ftype uint8, streamID, seq uint32, payload []byte) []byte {
+	now := time.Now()
 	q.mu.Lock()
 	data := q.arena.get(len(payload))
 	copy(data, payload)
-	q.entries[retransmitKey(streamID, seq)] = &retransmitEntry{
-		ftype:    ftype,
-		streamID: streamID,
-		seq:      seq,
-		data:     data,
-		sentAt:   time.Now(),
-	}
+	e := q.getEntry()
+	e.ftype = ftype
+	e.streamID = streamID
+	e.seq = seq
+	e.data = data
+	e.sentAt = now
+	e.retries = 0
+	q.entries[retransmitKey(streamID, seq)] = e
+	q.pushTail(e)
 	q.mu.Unlock()
 	return data
 }
@@ -156,20 +221,22 @@ func (q *retransmitQueue) ackOne(streamID, seq uint32) {
 	q.mu.Lock()
 	key := retransmitKey(streamID, seq)
 	if e, ok := q.entries[key]; ok {
-		q.pendingFree = append(q.pendingFree, e.data)
-		delete(q.entries, key)
+		q.removeLocked(key, e)
 	}
 	q.mu.Unlock()
 }
 
 // ackMany removes a batch of acknowledged frames for one stream, returning
 // the total payload size of the removed entries so the caller can shrink the
-// stream's bytes-in-flight accounting (see Stream.creditAcked), plus an RTT
-// sample for each entry that was ACKed without ever being retransmitted.
-// Retransmitted entries are excluded per Karn's algorithm: an ACK for a
-// multiply-sent frame can't be attributed to a specific transmission, so
-// timing it would poison the RTO estimate.
-func (q *retransmitQueue) ackMany(streamID uint32, seqs []uint32) (freedBytes int, rttSamples []time.Duration) {
+// stream's bytes-in-flight accounting (see Stream.creditAcked), plus a
+// single RTT sample: the minimum across the entries that were ACKed without
+// ever being retransmitted (0 if there were none). One sample per ACK frame
+// is plenty for the RTO estimator, taking the minimum biases toward the
+// least queueing-inflated measurement, and returning a scalar keeps this
+// per-ACK hot path allocation-free. Retransmitted entries are excluded per
+// Karn's algorithm: an ACK for a multiply-sent frame can't be attributed to
+// a specific transmission, so timing it would poison the RTO estimate.
+func (q *retransmitQueue) ackMany(streamID uint32, seqs []uint32) (freedBytes int, rttSample time.Duration) {
 	now := time.Now()
 	q.mu.Lock()
 	for _, seq := range seqs {
@@ -177,10 +244,11 @@ func (q *retransmitQueue) ackMany(streamID uint32, seqs []uint32) (freedBytes in
 		if e, ok := q.entries[key]; ok {
 			freedBytes += len(e.data)
 			if e.retries == 0 {
-				rttSamples = append(rttSamples, now.Sub(e.sentAt))
+				if s := now.Sub(e.sentAt); rttSample == 0 || s < rttSample {
+					rttSample = s
+				}
 			}
-			q.pendingFree = append(q.pendingFree, e.data)
-			delete(q.entries, key)
+			q.removeLocked(key, e)
 		}
 	}
 	q.mu.Unlock()
@@ -193,8 +261,7 @@ func (q *retransmitQueue) purgeStream(streamID uint32) {
 	q.mu.Lock()
 	for k, e := range q.entries {
 		if e.streamID == streamID {
-			q.pendingFree = append(q.pendingFree, e.data)
-			delete(q.entries, k)
+			q.removeLocked(k, e)
 		}
 	}
 	q.mu.Unlock()
@@ -235,23 +302,44 @@ func (q *retransmitQueue) getForResend(streamID, seq uint32) (e retransmitEntry,
 	}
 	entry.sentAt = time.Now()
 	entry.retries++
+	// Keep the list ordered by sentAt: this entry was just (about to be)
+	// resent, so it moves to the tail like any other resend.
+	q.unlink(entry)
+	q.pushTail(entry)
 	return *entry, true
 }
 
 // due returns a snapshot of entries that have been outstanding (since their
-// last resend) for at least rto. Their sentAt/retries are bumped in place so
-// a subsequent scan won't immediately re-select them.
-func (q *retransmitQueue) due(rto time.Duration) (resend []retransmitEntry) {
+// last resend) for at least rto. Their sentAt/retries are bumped in place
+// and they move to the list tail, so a subsequent scan won't immediately
+// re-select them.
+//
+// Because the list is ordered by sentAt (every (re)send moves an entry to
+// the tail stamped with now), the scan walks from the head and stops at the
+// first not-yet-due entry: O(number due), not O(number in flight). The
+// scanned bound caps the walk at one pass over the current population as
+// insurance against a non-positive rto, which would otherwise chase the
+// entries this same loop keeps re-appending.
+//
+// The returned slice is scratch storage reused by the next due call — it is
+// only safe to use from a single goroutine (retransmitLoop) and only until
+// the next call.
+func (q *retransmitQueue) due(rto time.Duration) []retransmitEntry {
 	now := time.Now()
 	q.mu.Lock()
-	for _, e := range q.entries {
+	resend := q.scratch[:0]
+	for scanned := len(q.entries); scanned > 0 && q.head != nil; scanned-- {
+		e := q.head
 		if now.Sub(e.sentAt) < rto {
-			continue
+			break
 		}
 		e.sentAt = now
 		e.retries++
+		q.unlink(e)
+		q.pushTail(e)
 		resend = append(resend, *e)
 	}
+	q.scratch = resend
 	q.mu.Unlock()
-	return
+	return resend
 }

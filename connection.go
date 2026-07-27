@@ -49,6 +49,7 @@ type Connection struct {
 	nextStream    uint32 // next stream ID to allocate
 	acceptCh      chan *Stream
 	sReadIdsToAck map[uint32][]uint32 // packet IDs to ACK per stream (recvMu)
+	ackScratch    []uint32            // reused decode buffer for incoming ACK frames (recvMu)
 
 	// deadStreams are tombstones for recently removed streams (recvMu).
 	// Late retransmits for them are ACKed and discarded instead of
@@ -608,21 +609,35 @@ func (c *Connection) readLoop() {
 			continue
 		}
 
+		// One recvMu acquisition per recvmmsg batch rather than per
+		// datagram: at high frame rates the per-datagram lock/unlock cycle
+		// (batchSize × 2 atomic ops per syscall) is measurable, and nothing
+		// inside the dispatch path blocks for long.
+		c.recvMu.Lock()
 		for i := 0; i < messages; i++ {
 			nbytes := int(c.recvEP.Hdrs[i].NTransferred)
 			if nbytes < frameHeaderSize {
 				continue // too small, discard
 			}
-			c.handleDatagram(c.recvBufs[i][:nbytes])
+			c.handleDatagramLocked(c.recvBufs[i][:nbytes])
 		}
-
-		c.flushPendingAcks()
+		c.flushPendingAcksLocked()
+		c.recvMu.Unlock()
 	}
 }
 
 // handleDatagram processes a single received datagram. Safe to call from
-// any goroutine (see recvMu).
+// any goroutine — used by Listener.readLoop's fallback path; the connection's
+// own readLoop batches the lock across a whole recvmmsg batch instead.
 func (c *Connection) handleDatagram(buf []byte) {
+	c.recvMu.Lock()
+	c.handleDatagramLocked(buf)
+	c.recvMu.Unlock()
+}
+
+// handleDatagramLocked processes a single received datagram. Caller holds
+// recvMu.
+func (c *Connection) handleDatagramLocked(buf []byte) {
 	f, err := decodeFrame(buf)
 	if err != nil {
 		return // discard malformed frames
@@ -637,9 +652,6 @@ func (c *Connection) handleDatagram(buf []byte) {
 	// WithIdleTimeout's documented "equivalent to quic-go's MaxIdleTimeout"
 	// behavior, where the idle timer resets on any received packet.
 	atomic.StoreInt32(&c.missedPongs, 0)
-
-	c.recvMu.Lock()
-	defer c.recvMu.Unlock()
 
 	switch f.ftype {
 	case frameData:
@@ -675,28 +687,35 @@ func (c *Connection) handleDatagram(buf []byte) {
 	}
 }
 
-// flushPendingAcks sends any accumulated ACKs, chunked to fit the wire
-// format, then clears the pending list. Called after each receive batch.
+// flushPendingAcks sends any accumulated ACKs. Locking wrapper for callers
+// outside the connection's own readLoop (Listener fallback path).
 func (c *Connection) flushPendingAcks() {
 	c.recvMu.Lock()
-	if len(c.sReadIdsToAck) == 0 {
-		c.recvMu.Unlock()
-		return
-	}
-	pending := c.sReadIdsToAck
-	c.sReadIdsToAck = make(map[uint32][]uint32)
+	c.flushPendingAcksLocked()
 	c.recvMu.Unlock()
+}
 
+// flushPendingAcksLocked sends any accumulated ACKs, chunked to fit the wire
+// format. Called after each receive batch, holding recvMu. The per-stream
+// seq slices are truncated in place and retained in the map (rather than the
+// old swap-in-a-fresh-map approach) so steady-state flushing allocates
+// nothing; removeStream deletes a stream's slot when the stream goes away.
+func (c *Connection) flushPendingAcksLocked() {
 	maxAcks := maxAckSeqsPerFrame(c.cfg.maxPayload)
-	for streamID, seqs := range pending {
-		for len(seqs) > 0 {
-			n := len(seqs)
+	for streamID, seqs := range c.sReadIdsToAck {
+		if len(seqs) == 0 {
+			continue
+		}
+		rest := seqs
+		for len(rest) > 0 {
+			n := len(rest)
 			if n > maxAcks {
 				n = maxAcks
 			}
-			c.sendACKFrame(streamID, seqs[:n])
-			seqs = seqs[n:]
+			c.sendACKFrame(streamID, rest[:n])
+			rest = rest[n:]
 		}
+		c.sReadIdsToAck[streamID] = seqs[:0]
 	}
 }
 
@@ -852,13 +871,14 @@ func (c *Connection) handleHandshake(f frame) {
 }
 
 func (c *Connection) handleACK(f frame) {
-	seqs, err := decodeAckFrame(f)
+	seqs, err := decodeAckFrameInto(f, c.ackScratch)
 	if err != nil {
 		return // discard malformed ACK
 	}
-	freed, rttSamples := c.retransmit.ackMany(f.streamID, seqs)
-	for _, sample := range rttSamples {
-		c.updateRTO(sample)
+	c.ackScratch = seqs[:0] // retain capacity for the next ACK frame
+	freed, rttSample := c.retransmit.ackMany(f.streamID, seqs)
+	if rttSample > 0 {
+		c.updateRTO(rttSample)
 	}
 	if freed == 0 {
 		return
@@ -909,6 +929,9 @@ func (c *Connection) removeStream(id uint32) {
 
 	c.recvMu.Lock()
 	c.deadStreams[id] = time.Now()
+	// Drop the stream's retained ACK-accumulation slot (kept alive across
+	// flushes for reuse — see flushPendingAcksLocked).
+	delete(c.sReadIdsToAck, id)
 	c.recvMu.Unlock()
 
 	select {
