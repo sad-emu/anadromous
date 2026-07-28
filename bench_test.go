@@ -95,6 +95,16 @@ func BenchmarkThroughputLossyNoFEC(b *testing.B) {
 	benchThroughput(b, cs, ss)
 }
 
+// BenchmarkThroughputLossyBigWindow probes whether lossy throughput is
+// bound by the in-flight cap (bandwidth-delay ceiling) rather than by
+// recovery latency: if this scales with the cap, the path to more lossy
+// throughput is provisioning (receive socket buffers + cap), not protocol
+// work.
+func BenchmarkThroughputLossyBigWindow(b *testing.B) {
+	cs, ss := lossyBenchPair(b, WithMaxBytesInFlight(32<<20))
+	benchThroughput(b, cs, ss)
+}
+
 func lossyBenchPair(b *testing.B, extra ...Option) (*Stream, *Stream) {
 	var proxy *lossyProxy
 	return benchPairVia(b, func(serverAddr string) string {

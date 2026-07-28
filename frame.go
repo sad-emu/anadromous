@@ -29,7 +29,8 @@ const (
 // fecMetaLen is the per-frame metadata prefix present on DATA and FEC frame
 // payloads when FEC is enabled (see WithFEC): payload = [meta(4) | data].
 // For DATA frames meta is reserved (0). For FEC frames, seq carries the
-// group index k (covering DATA seqs [k*G, k*G+count)) and meta packs
+// group's base seq (the group covers the strided DATA seqs base, base+G,
+// ..., base+(count-1)*G — see Stream.fecFoldLocked) and meta packs
 // count<<16 | xorOfMemberLengths; data is the XOR of the members' data,
 // each padded to the group's max length. Carrying the prefix on data frames
 // too (rather than only on parity) keeps full DATA and full parity frames

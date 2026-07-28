@@ -64,19 +64,29 @@ func (c *config) dataCap() int {
 }
 
 // effectiveMaxInFlight resolves the per-stream cap on sent-but-unACKed
-// bytes. An explicit WithMaxBytesInFlight wins; otherwise the cap is twice
-// the configured UDP socket receive buffer — the kernel grants sockets 2×
-// their SO_RCVBUF request, so this is exactly what a peer provisioned like
-// us can absorb with a completely stalled reader. Benchmarking bears the
-// coupling out: at 2×recvBufSize the loopback benchmark is drop-free and
-// stable, while even 4× reliably tips into the drop→retransmit collapse
-// documented on WithMaxBytesInFlight. Raise WithRecvBufferSize (and
-// net.core.rmem_max, on both ends) to raise this cap for high-BDP links.
+// bytes from configuration alone. An explicit WithMaxBytesInFlight wins;
+// otherwise the cap is 1.5× the configured UDP socket receive buffer: the
+// kernel grants sockets 2× their SO_RCVBUF request, so 2× recvBufSize is
+// what a peer provisioned like us can absorb with a completely stalled
+// reader — but capping at exactly that leaves zero margin, and
+// retransmitted duplicates ride ON TOP of the cap (bytesInFlight counts
+// unique unACKed bytes, not wire bytes), so a single drop puts the wire
+// volume over the buffer and sustains the drop→retransmit collapse
+// documented on WithMaxBytesInFlight. Benchmarking bears the margin out: at
+// 2× the loopback benchmark bimodally collapses to ~1/5th throughput, while
+// 1.5× is drop-free, stable, and faster at the top end. Raise
+// WithRecvBufferSize (and net.core.rmem_max, on both ends) to raise this
+// cap for high-BDP links.
+//
+// newConnection improves on the 2×-doubling assumption by reading the
+// actually-granted (rmem_max-clamped) buffer size back from the socket and
+// applying the same 25% margin to that; this config-only derivation is the
+// fallback when that read fails.
 func (c *config) effectiveMaxInFlight() int {
 	if c.maxInFlight > 0 {
 		return c.maxInFlight
 	}
-	return 2 * c.recvBufSize
+	return c.recvBufSize + c.recvBufSize/2
 }
 
 // maxDatagram returns the full datagram buffer size for this config.
@@ -168,8 +178,8 @@ func WithRetransmitTimeout(d time.Duration) Option {
 // may have outstanding; Write blocks once the cap is reached. Size it to the
 // link's bandwidth-delay product (bytes/sec × round-trip seconds), the same
 // way the stream buffer is sized — the cap is additionally bounded above by
-// the stream buffer size. When unset it defaults to streamBufSize/8 clamped
-// to [8MB, 64MB] — see config.effectiveMaxInFlight.
+// the stream buffer size. When unset it defaults to 1.5× the socket receive
+// buffer size — see config.effectiveMaxInFlight.
 //
 // This cap is the protocol's only brake, so don't set it huge "to be safe":
 // with no congestion control by design, everything outstanding is re-blasted

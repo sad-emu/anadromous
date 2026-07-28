@@ -87,6 +87,12 @@ type Connection struct {
 	// no-backoff retransmission.
 	retransmit *retransmitQueue
 
+	// maxInFlightBytes is the resolved per-stream cap on sent-but-unACKed
+	// bytes (see Stream.inFlightCap). Fixed at construction: an explicit
+	// WithMaxBytesInFlight wins; otherwise it's derived from the socket's
+	// actually-granted SO_RCVBUF — see newConnection.
+	maxInFlightBytes int64
+
 	// onClose, if set, is invoked once when the connection closes (used by
 	// Listener to remove the connection from its tracking map).
 	onClose func()
@@ -149,6 +155,23 @@ func newConnection(sock *unet.Socket, fd int, remote unet.Address, connID uint64
 	}
 	c.rttMs.Store(-1)
 	c.rtoNs.Store(int64(cfg.retransmitTmout))
+
+	// Resolve the in-flight cap. Without an explicit WithMaxBytesInFlight,
+	// prefer the kernel's actually-granted receive buffer (getsockopt returns
+	// the doubled — and, crucially, rmem_max-clamped — real capacity) over
+	// the configured request as the estimate of what a peer provisioned like
+	// us can absorb, and keep a 25% margin under it: retransmitted duplicates
+	// ride on top of the cap (bytesInFlight counts unique unACKed bytes, not
+	// wire bytes), so a cap equal to the buffer lets a single drop overflow
+	// it and sustain the drop→retransmit collapse documented on
+	// WithMaxBytesInFlight. On an unclamped system this equals
+	// effectiveMaxInFlight's 1.5×recvBufSize fallback.
+	c.maxInFlightBytes = int64(cfg.effectiveMaxInFlight())
+	if cfg.maxInFlight == 0 {
+		if granted, err := syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF); err == nil && granted > 0 {
+			c.maxInFlightBytes = int64(granted - granted/4)
+		}
+	}
 
 	// Client-initiated streams use odd IDs (1,3,5,...).
 	// Server-initiated streams use even IDs (2,4,6,...).
@@ -415,18 +438,20 @@ func (c *Connection) sendDataFrame(streamID, seq uint32, payload []byte) error {
 	return c.commitSendSlotZeroCopy(idx, hdrLen, data)
 }
 
-// sendFecFrame sends a parity frame covering count DATA frames of group k
-// (seqs [k*G, k*G+count)). Unreliable by design: parity is itself
+// sendFecFrame sends a parity frame covering count DATA frames strided G
+// apart starting at base (seqs base, base+G, ..., base+(count-1)*G — see
+// Stream.fecFoldLocked for why groups interleave). The base seq rides in
+// the header's seq field. Unreliable by design: parity is itself
 // redundancy, so a lost parity frame just means that group has no FEC
 // protection and recovery falls back to NACK/timeout. xorData is copied
 // into the send slot's own buffer (it's the stream's live accumulator).
-func (c *Connection) sendFecFrame(streamID, group uint32, count, xorLen int, xorData []byte) error {
+func (c *Connection) sendFecFrame(streamID, base uint32, count, xorLen int, xorData []byte) error {
 	buf, idx, err := c.acquireSendSlot()
 	if err != nil {
 		return err
 	}
 	meta := uint32(count)<<16 | uint32(xorLen)
-	encodeHeader(buf, frameFEC, streamID, group, uint32(fecMetaLen+len(xorData)))
+	encodeHeader(buf, frameFEC, streamID, base, uint32(fecMetaLen+len(xorData)))
 	binary.BigEndian.PutUint32(buf[frameHeaderSize:], meta)
 	copy(buf[frameHeaderSize+fecMetaLen:], xorData)
 	return c.commitSendSlot(idx, frameHeaderSize+fecMetaLen+len(xorData))
@@ -734,8 +759,22 @@ func (c *Connection) retransmitLoop() {
 			c.flushSend()
 		}
 
+		c.tailNackScan()
 		c.gcStreams()
 	}
+}
+
+// tailNackScan gives every stream a chance to NACK gaps that arrivals will
+// never reveal (lost burst tails, fully-lost batches) — see
+// Stream.maybeTailNack. Runs on the retransmit loop's tick; per-stream
+// grace/throttle checks keep quiet streams nearly free.
+func (c *Connection) tailNackScan() {
+	now := time.Now()
+	c.streamMu.RLock()
+	for _, s := range c.streams {
+		s.maybeTailNack(now)
+	}
+	c.streamMu.RUnlock()
 }
 
 // gcStreams removes streams whose both directions have finished and whose

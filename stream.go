@@ -10,16 +10,32 @@ import (
 )
 
 // xorInto XORs src into dst (dst[i] ^= src[i] for i < len(src)); dst must
-// be at least as long as src. Word-at-a-time: this runs once per DATA frame
-// on the send path and per group member on FEC reconstruction, and a
-// byte-wise loop here measurably drags whole-connection throughput.
+// be at least as long as src. This runs once per DATA frame on the send path
+// and per group member on FEC reconstruction, so it has to move at memory
+// speed: the main loop works on 32-byte blocks through array pointers (one
+// bounds check per block, then four independent uint64 XORs that the CPU can
+// overlap) — a plain byte or single-word loop here measurably drags
+// whole-connection throughput.
 func xorInto(dst, src []byte) {
+	n := len(src)
 	i := 0
-	for ; i+8 <= len(src); i += 8 {
+	for ; i+32 <= n; i += 32 {
+		d := (*[32]byte)(dst[i:])
+		s := (*[32]byte)(src[i:])
+		x0 := binary.LittleEndian.Uint64(d[0:8]) ^ binary.LittleEndian.Uint64(s[0:8])
+		x1 := binary.LittleEndian.Uint64(d[8:16]) ^ binary.LittleEndian.Uint64(s[8:16])
+		x2 := binary.LittleEndian.Uint64(d[16:24]) ^ binary.LittleEndian.Uint64(s[16:24])
+		x3 := binary.LittleEndian.Uint64(d[24:32]) ^ binary.LittleEndian.Uint64(s[24:32])
+		binary.LittleEndian.PutUint64(d[0:8], x0)
+		binary.LittleEndian.PutUint64(d[8:16], x1)
+		binary.LittleEndian.PutUint64(d[16:24], x2)
+		binary.LittleEndian.PutUint64(d[24:32], x3)
+	}
+	for ; i+8 <= n; i += 8 {
 		binary.LittleEndian.PutUint64(dst[i:],
 			binary.LittleEndian.Uint64(dst[i:])^binary.LittleEndian.Uint64(src[i:]))
 	}
-	for ; i < len(src); i++ {
+	for ; i < n; i++ {
 		dst[i] ^= src[i]
 	}
 }
@@ -87,6 +103,7 @@ type Stream struct {
 	gapSeq         uint32                      // readSeq value of the gap currently being tracked for fast retransmit
 	gapFirstSeenAt time.Time                   // when that gap was first observed
 	lastNackAt     time.Time                   // when a NACK was last sent for the current gap
+	lastArrivalAt  time.Time                   // last arrival while receive state was gapped; drives tail NACKs
 	maxSeenSeq     uint32                      // highest data seq observed; bounds the NACK gap scan
 	nackScratch    []uint32                    // reused gap-list buffer for NACK frames
 	createdAt      time.Time                   // stream creation time; bounds the ramp-up window
@@ -106,12 +123,21 @@ type Stream struct {
 	ackedBytes    int64  // cumulative bytes acknowledged so far (not necessarily contiguous — ACKs are selective)
 	writeDeadline time.Time
 
-	// FEC sender accumulator (writeMu): running XOR over the current
-	// parity group's data frames — see Stream.fecFoldLocked.
-	fecXor    []byte
-	fecMaxLen int
-	fecLenXor uint32
-	fecCount  int
+	// FEC sender accumulators (writeMu): one lane per residue class of
+	// seq mod G, so each parity group's members are strided G apart — see
+	// Stream.fecFoldLocked.
+	fecLanes []fecLane
+}
+
+// fecLane accumulates one interleaved parity group: the running XOR of its
+// members' data and lengths, the first member's seq (the group's wire
+// identity), and how many members have been folded so far.
+type fecLane struct {
+	xor    []byte
+	maxLen int
+	lenXor uint32
+	count  int
+	base   uint32
 }
 
 func newStream(id uint32, conn *Connection, bufSize int) *Stream {
@@ -291,42 +317,49 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 	return n, nil
 }
 
-// fecFoldLocked folds a just-sent DATA frame into the current parity
-// group's running XOR, emitting the parity frame when the group fills.
-// Caller holds writeMu.
+// fecFoldLocked folds a just-sent DATA frame into its parity lane's running
+// XOR, emitting the lane's parity frame when its group fills. Lanes are the
+// residue classes of seq mod G, so one group's members are strided G apart
+// on the wire: a burst loss of up to G consecutive frames (e.g. one dropped
+// GSO super-packet) puts at most ONE loss in each group, keeping every
+// affected group single-loss-recoverable — consecutive grouping would
+// instead concentrate the whole burst in one unrecoverable group. Caller
+// holds writeMu.
 func (s *Stream) fecFoldLocked(seq uint32, chunk []byte) {
 	g := s.conn.cfg.fecGroup
 	if g <= 0 {
 		return
 	}
-	if s.fecXor == nil {
-		s.fecXor = make([]byte, s.conn.cfg.dataCap())
+	if s.fecLanes == nil {
+		s.fecLanes = make([]fecLane, g)
 	}
-	xorInto(s.fecXor, chunk)
-	if len(chunk) > s.fecMaxLen {
-		s.fecMaxLen = len(chunk)
+	ln := &s.fecLanes[seq%uint32(g)]
+	if ln.xor == nil {
+		ln.xor = make([]byte, s.conn.cfg.dataCap())
 	}
-	s.fecLenXor ^= uint32(len(chunk))
-	s.fecCount++
-	if s.fecCount >= g {
-		s.emitFecLocked(seq)
+	if ln.count == 0 {
+		ln.base = seq
+	}
+	xorInto(ln.xor, chunk)
+	if len(chunk) > ln.maxLen {
+		ln.maxLen = len(chunk)
+	}
+	ln.lenXor ^= uint32(len(chunk))
+	ln.count++
+	if ln.count >= g {
+		s.emitLaneLocked(ln)
 	}
 }
 
-// emitFecLocked sends the parity frame for the accumulated (possibly
-// partial) group ending at lastSeq and resets the accumulator. Caller holds
-// writeMu.
-func (s *Stream) emitFecLocked(lastSeq uint32) {
-	if s.fecCount == 0 {
+// emitLaneLocked sends a lane's (possibly partial) parity frame and resets
+// the lane. Caller holds writeMu.
+func (s *Stream) emitLaneLocked(ln *fecLane) {
+	if ln.count == 0 {
 		return
 	}
-	first := lastSeq - uint32(s.fecCount-1)
-	group := first / uint32(s.conn.cfg.fecGroup)
-	s.conn.sendFecFrame(s.id, group, s.fecCount, int(s.fecLenXor), s.fecXor[:s.fecMaxLen])
-	for i := 0; i < s.fecMaxLen; i++ {
-		s.fecXor[i] = 0
-	}
-	s.fecMaxLen, s.fecLenXor, s.fecCount = 0, 0, 0
+	s.conn.sendFecFrame(s.id, ln.base, ln.count, int(ln.lenXor), ln.xor[:ln.maxLen])
+	clear(ln.xor[:ln.maxLen]) // compiles to memclr — an indexed byte loop here costs ~7% of whole-connection CPU
+	ln.maxLen, ln.lenXor, ln.count = 0, 0, 0
 }
 
 // setMaxSendOffset applies an absolute flow-control watermark received from
@@ -350,14 +383,14 @@ func (s *Stream) bytesInFlightLocked() int64 {
 }
 
 // inFlightCap is the bound Write enforces on bytesInFlight: the configured
-// or derived cap (see config.effectiveMaxInFlight), never more than the
+// or derived cap (resolved once in newConnection), never more than the
 // stream buffer size.
 func (s *Stream) inFlightCap() int64 {
-	cap := s.conn.cfg.effectiveMaxInFlight()
-	if max := s.maxBufSize(); cap > max {
+	cap := s.conn.maxInFlightBytes
+	if max := int64(s.maxBufSize()); cap > max {
 		cap = max
 	}
-	return int64(cap)
+	return cap
 }
 
 // creditAcked records newly-acknowledged bytes, shrinking bytesInFlight and
@@ -390,11 +423,11 @@ func (s *Stream) CloseWrite() error {
 	}
 	s.writeFIN = true
 	seq := s.writeSeq
-	// Flush the in-progress parity group (short groups are legal on the
-	// wire) so the stream's final frames get FEC protection too; the FIN
-	// itself is outside FEC (it's reliably retransmitted anyway).
-	if seq > 0 {
-		s.emitFecLocked(seq - 1)
+	// Flush every lane's in-progress parity group (short groups are legal
+	// on the wire) so the stream's final frames get FEC protection too; the
+	// FIN itself is outside FEC (it's reliably retransmitted anyway).
+	for i := range s.fecLanes {
+		s.emitLaneLocked(&s.fecLanes[i])
 	}
 	s.writeCond.Broadcast()
 	s.writeMu.Unlock()
@@ -420,8 +453,8 @@ func (s *Stream) abortWriteLocked(code uint64, sendReset bool) {
 	s.writeErr = ErrStreamReset
 	s.writeFIN = true
 	seq := s.writeSeq
-	// Abandon the in-progress parity group — the peer no longer wants it.
-	s.fecMaxLen, s.fecLenXor, s.fecCount = 0, 0, 0
+	// Abandon the in-progress parity groups — the peer no longer wants them.
+	s.fecLanes = nil
 	s.writeCond.Broadcast()
 	s.writeMu.Unlock()
 
@@ -502,6 +535,12 @@ func (s *Stream) deliver(seq uint32, payload []byte, isFin bool) (ack bool) {
 // deliverLocked is deliver's body; FEC reconstruction (applyFec) calls it
 // directly to inject a rebuilt frame while already holding readMu.
 func (s *Stream) deliverLocked(seq uint32, payload []byte, isFin bool) (ack bool) {
+	// While the receive state is gapped (or a FIN is pending), track
+	// arrival times so the tail-NACK scan can detect silence — see
+	// maybeTailNack. Clean in-order flow skips the clock read.
+	if len(s.reorder) > 0 || s.finRecvd {
+		s.lastArrivalAt = time.Now()
+	}
 
 	if s.readCanceled || s.readErr != nil {
 		// Read side is done — discard, but acknowledge so the peer's
@@ -712,8 +751,11 @@ func (s *Stream) fecStoreOwnedLocked(seq uint32, data []byte) {
 		s.reorderPutLocked(old)
 	}
 	s.fecCache[seq] = data
-	if len(s.fecCache) > 8*g && s.readSeq > uint32(4*g) {
-		limit := s.readSeq - uint32(4*g)
+	// Retention must cover a full interleaved group span (G lanes × G
+	// members = G² seqs) plus slack, since a gap pinning readSeq may need
+	// members up to (G-1)*G seqs behind it.
+	if window := 2 * g * g; len(s.fecCache) > 3*g*g && s.readSeq > uint32(window) {
+		limit := s.readSeq - uint32(window)
 		for k, v := range s.fecCache {
 			if k < limit {
 				s.reorderPutLocked(v)
@@ -740,28 +782,28 @@ const (
 	fecPendingMembers        // >1 member still in flight — worth retrying later
 )
 
-// applyFec processes a parity frame covering DATA seqs
-// [group*G, group*G+count): if exactly one member is missing and every
-// other member's data is still available (in the reorder map or the FEC
-// cache), the missing frame is reconstructed by XOR and injected as if it
-// had arrived — zero-round-trip loss recovery. A parity whose group still
-// has several members in flight is buffered and retried as members arrive.
-// Returns whether a frame was recovered right now. Idempotent: on a
+// applyFec processes a parity frame covering the strided DATA seqs
+// base, base+G, ..., base+(count-1)*G: if exactly one member is missing and
+// every other member's data is still available (in the reorder map or the
+// FEC cache), the missing frame is reconstructed by XOR and injected as if
+// it had arrived — zero-round-trip loss recovery. A parity whose group
+// still has several members in flight is buffered and retried as members
+// arrive. Returns whether a frame was recovered right now. Idempotent: on a
 // duplicate parity, nothing is missing anymore.
-func (s *Stream) applyFec(group uint32, count, xorLen int, xorData []byte) (recovered bool) {
+func (s *Stream) applyFec(base uint32, count, xorLen int, xorData []byte) (recovered bool) {
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
 	if s.readCanceled || s.readErr != nil {
 		return false
 	}
-	switch s.tryReconstructLocked(group, count, xorLen, xorData) {
+	switch s.tryReconstructLocked(base, count, xorLen, xorData) {
 	case fecRecovered:
 		return true
 	case fecPendingMembers:
 		if s.fecPending == nil {
 			s.fecPending = make(map[uint32]fecPendingParity)
 		}
-		if old, ok := s.fecPending[group]; ok {
+		if old, ok := s.fecPending[base]; ok {
 			s.reorderPutLocked(old.data)
 		} else if len(s.fecPending) >= 16 {
 			// Bound the buffer: evict the oldest group.
@@ -776,44 +818,53 @@ func (s *Stream) applyFec(group uint32, count, xorLen int, xorData []byte) (reco
 		}
 		cp := s.reorderGetLocked(len(xorData))
 		copy(cp, xorData)
-		s.fecPending[group] = fecPendingParity{count: count, xorLen: xorLen, data: cp}
+		s.fecPending[base] = fecPendingParity{count: count, xorLen: xorLen, data: cp}
 	}
 	return false
 }
 
-// fecRetryLocked re-attempts a buffered parity after a frame of its group
-// arrived. Caller holds readMu.
+// fecRetryLocked re-attempts a buffered parity after the arrival of seq,
+// which may have been the member its group was waiting on. Groups are
+// keyed by base seq and strided, so membership is (seq-base)%G == 0 within
+// the group's span; the pending map is small (≤16), so a linear scan is
+// fine. Caller holds readMu.
 func (s *Stream) fecRetryLocked(seq uint32) {
 	if len(s.fecPending) == 0 {
 		return
 	}
-	group := seq / uint32(s.conn.cfg.fecGroup)
-	p, ok := s.fecPending[group]
-	if !ok {
-		return
-	}
-	// Claim the entry before reconstructing so the injected frame's own
-	// pass through this hook can't double-process it.
-	delete(s.fecPending, group)
-	switch s.tryReconstructLocked(group, p.count, p.xorLen, p.data) {
-	case fecPendingMembers:
-		s.fecPending[group] = p // still waiting; put it back
-	case fecRecovered:
-		s.conn.statFecRecovered.Add(1)
-		s.reorderPutLocked(p.data)
-	default:
-		s.reorderPutLocked(p.data)
+	g := uint32(s.conn.cfg.fecGroup)
+	for base, p := range s.fecPending {
+		if seq < base {
+			continue
+		}
+		off := seq - base
+		if off%g != 0 || off/g >= uint32(p.count) {
+			continue
+		}
+		// Claim the entry before reconstructing so the injected frame's own
+		// pass through this hook can't double-process it.
+		delete(s.fecPending, base)
+		switch s.tryReconstructLocked(base, p.count, p.xorLen, p.data) {
+		case fecPendingMembers:
+			s.fecPending[base] = p // still waiting; put it back
+		case fecRecovered:
+			s.conn.statFecRecovered.Add(1)
+			s.reorderPutLocked(p.data)
+		default:
+			s.reorderPutLocked(p.data)
+		}
+		return // a seq belongs to exactly one group
 	}
 }
 
 // tryReconstructLocked attempts the group reconstruction described on
 // applyFec. Caller holds readMu.
-func (s *Stream) tryReconstructLocked(group uint32, count, xorLen int, xorData []byte) int {
-	first := group * uint32(s.conn.cfg.fecGroup)
+func (s *Stream) tryReconstructLocked(base uint32, count, xorLen int, xorData []byte) int {
+	stride := uint32(s.conn.cfg.fecGroup)
 	missingSeq := uint32(0)
 	missing := 0
 	for i := 0; i < count && missing < 2; i++ {
-		seq := first + uint32(i)
+		seq := base + uint32(i)*stride
 		if _, ok := s.reorder[seq]; ok {
 			continue
 		}
@@ -837,7 +888,7 @@ func (s *Stream) tryReconstructLocked(group uint32, count, xorLen int, xorData [
 	copy(buf, xorData)
 	length := xorLen
 	for i := 0; i < count; i++ {
-		seq := first + uint32(i)
+		seq := base + uint32(i)*stride
 		if seq == missingSeq {
 			continue
 		}
@@ -970,6 +1021,7 @@ const maxNackSeqsPerFire = 64
 // holds readMu.
 func (s *Stream) maybeFastRetransmitLocked() {
 	now := time.Now()
+	s.lastArrivalAt = now // an out-of-order arrival is still an arrival
 	grace := s.conn.currentRTO() / reorderGraceFraction
 
 	if s.readSeq != s.gapSeq {
@@ -983,13 +1035,51 @@ func (s *Stream) maybeFastRetransmitLocked() {
 		return
 	}
 	s.lastNackAt = now
+	s.fireNackLocked()
+}
 
+// maybeTailNack is the silence-driven counterpart of fast retransmit,
+// called periodically from the connection's retransmit loop: arrival-driven
+// NACKs only fire when a later frame ARRIVES to reveal a gap, so a lost
+// burst tail (nothing sent after it) or a fully-lost batch would otherwise
+// wait out the whole retransmit timeout. If the stream knows it has a gap —
+// buffered out-of-order frames, or a FIN whose preceding data hasn't all
+// arrived — and nothing has arrived for a grace period, NACK the missing
+// frames without waiting for further evidence.
+func (s *Stream) maybeTailNack(now time.Time) {
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
+	if s.readErr != nil || s.readCanceled {
+		return
+	}
+	gap := len(s.reorder) > 0 || (s.finRecvd && s.readSeq < s.finSeq)
+	if !gap || s.lastArrivalAt.IsZero() {
+		return
+	}
+	grace := s.conn.currentRTO() / reorderGraceFraction
+	if now.Sub(s.lastArrivalAt) < grace || now.Sub(s.lastNackAt) < grace {
+		return
+	}
+	s.lastNackAt = now
+	s.fireNackLocked()
+}
+
+// fireNackLocked sends a NACK listing every missing seq up to the highest
+// evidence of sent data: the highest seq seen, or the FIN position when the
+// peer has already FINed (covering tail frames that were lost without any
+// later arrival to reveal them). Caller holds readMu and has applied the
+// grace/throttle checks.
+func (s *Stream) fireNackLocked() {
 	gaps := s.nackScratch[:0]
 	max := maxNackSeqsPerFire
 	if lim := maxAckSeqsPerFrame(s.conn.cfg.maxPayload); max > lim {
 		max = lim
 	}
-	for seq := s.readSeq; seq <= s.maxSeenSeq && len(gaps) < max; seq++ {
+	hi := s.maxSeenSeq
+	if s.finRecvd && s.finSeq > 0 && s.finSeq-1 > hi {
+		hi = s.finSeq - 1
+	}
+	for seq := s.readSeq; seq <= hi && len(gaps) < max; seq++ {
 		if _, buffered := s.reorder[seq]; !buffered {
 			gaps = append(gaps, seq)
 		}
