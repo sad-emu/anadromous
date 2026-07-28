@@ -176,11 +176,15 @@ func (r *sendRing) enter(toSubmit, minComplete, flags int) (consumed int, errno 
 	return int(n), errno
 }
 
-// submitSendmsg queues one async SENDMSG per msghdr and submits them in a
-// single io_uring_enter. gen tags the completions (see outstanding). The
-// msghdrs, their iovecs, and everything the iovecs point at must stay
-// untouched until the completions are reaped.
-func (r *sendRing) submitSendmsg(sockFd int, hdrs []unet.MMsghdr, gen int) syscall.Errno {
+// submitSendmsg queues one SENDMSG per msghdr and submits them in a single
+// io_uring_enter. gen tags the completions (see outstanding); sqeFlags is 0
+// or iosqeAsync — inline (0) submissions execute during the enter itself
+// (UDP sendmsg completes non-blocking), giving sendmmsg-like latency for
+// small control flushes, while iosqeAsync buys bulk batches the io-wq
+// pipelining at the cost of a worker wakeup. The msghdrs, their iovecs, and
+// everything the iovecs point at must stay untouched until the completions
+// are reaped.
+func (r *sendRing) submitSendmsg(sockFd int, hdrs []unet.MMsghdr, gen int, sqeFlags uint8) syscall.Errno {
 	for len(hdrs) > 0 {
 		tail := *r.sqTail
 		head := atomic.LoadUint32(r.sqHead)
@@ -202,7 +206,7 @@ func (r *sendRing) submitSendmsg(sockFd int, hdrs []unet.MMsghdr, gen int) sysca
 			idx := (tail + uint32(i)) & r.sqMask
 			r.sqes[idx] = ioUringSqe{
 				opcode:   ioringOpSendmsg,
-				flags:    iosqeAsync,
+				flags:    sqeFlags,
 				fd:       int32(sockFd),
 				addr:     uint64(uintptr(unsafe.Pointer(&hdrs[i].Msghdr))),
 				len:      1,

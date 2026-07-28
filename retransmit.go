@@ -358,13 +358,22 @@ func (q *retransmitQueue) drainPendingFreeFirst(n int) {
 // an immediate fast-retransmit resend, bumping its sentAt/retries exactly
 // like due() would, so the periodic scanner doesn't immediately re-select it
 // too. ok is false if the frame isn't outstanding (already acknowledged, or
-// a stale/unknown NACK) — callers must treat that as a no-op, not an error.
-func (q *retransmitQueue) getForResend(streamID, seq uint32) (e retransmitEntry, ok bool) {
+// a stale/unknown NACK), or if it was already (re)sent within minAge — a
+// NACK reflects the receiver's state at least half an RTT ago, so a NACK
+// for a frame that was resent more recently than that is stale evidence,
+// not proof the resend was lost. Repeat NACK volleys for a still-open gap
+// (throttled by a grace much shorter than the RTT) and outright duplicated
+// NACK datagrams would otherwise each trigger a fresh copy of every listed
+// frame. Callers must treat ok=false as a no-op, not an error.
+func (q *retransmitQueue) getForResend(streamID, seq uint32, minAge time.Duration) (e retransmitEntry, ok bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	key := retransmitKey(streamID, seq)
 	entry, found := q.entries[key]
 	if !found {
+		return retransmitEntry{}, false
+	}
+	if minAge > 0 && time.Since(entry.sentAt) < minAge {
 		return retransmitEntry{}, false
 	}
 	entry.sentAt = time.Now()

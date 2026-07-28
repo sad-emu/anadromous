@@ -146,3 +146,20 @@ func benchThroughput(b *testing.B, cs, ss *Stream) {
 		cs.conn.statResends.Load(), ss.conn.statReorder.Load(),
 		ss.conn.statFecRecovered.Load())
 }
+
+// BenchmarkThroughputLossyBigWindow2D adds the second FEC dimension (row
+// parity, WithFEC2D) on top of the big-window lossy config — the loss-bound
+// regime where multi-loss groups falling back to NACK/RTO recovery are what
+// throughput dies of.
+func BenchmarkThroughputLossyBigWindow2D(b *testing.B) {
+	cs, ss := lossyBenchPair(b, WithMaxBytesInFlight(32<<20), WithFEC2D(true))
+	benchThroughput(b, cs, ss)
+}
+
+// BenchmarkThroughputLossy2D measures the recommended lossy-link
+// configuration: default (RTT-aware, granted-buffer-derived) window plus
+// the second FEC dimension for multi-loss recovery.
+func BenchmarkThroughputLossy2D(b *testing.B) {
+	cs, ss := lossyBenchPair(b, WithFEC2D(true))
+	benchThroughput(b, cs, ss)
+}

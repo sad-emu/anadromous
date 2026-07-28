@@ -99,11 +99,13 @@ type Connection struct {
 	// no-backoff retransmission.
 	retransmit *retransmitQueue
 
-	// maxInFlightBytes is the resolved per-stream cap on sent-but-unACKed
-	// bytes (see Stream.inFlightCap). Fixed at construction: an explicit
-	// WithMaxBytesInFlight wins; otherwise it's derived from the socket's
-	// actually-granted SO_RCVBUF — see newConnection.
-	maxInFlightBytes int64
+	// inFlightCapLan/Wan are the two per-stream caps on sent-but-unACKed
+	// bytes that inFlightCap switches between by measured RTT (see that
+	// method for the physics). Fixed at construction: an explicit
+	// WithMaxBytesInFlight sets both; otherwise they're derived from the
+	// socket's actually-granted SO_RCVBUF — see newConnection.
+	inFlightCapLan int64
+	inFlightCapWan int64
 
 	// onClose, if set, is invoked once when the connection closes (used by
 	// Listener to remove the connection from its tracking map).
@@ -127,12 +129,14 @@ type Connection struct {
 
 	// RTT/RTO estimation (RFC 6298, Jacobson/Karels): srtt/rttvar are only
 	// touched by updateRTO, called from handleACK and the PONG handler,
-	// both of which already run under recvMu. rtoNs is the published,
-	// lock-free view of the current RTO that retransmitLoop and
-	// fast-retransmit read from any goroutine — see currentRTO.
-	srtt   time.Duration
-	rttvar time.Duration
-	rtoNs  atomic.Int64
+	// both of which already run under recvMu. rtoNs and rttvarNs are the
+	// published, lock-free views that retransmitLoop and fast-retransmit
+	// read from any goroutine — see currentRTO and reorderGrace.
+	srtt     time.Duration
+	rttvar   time.Duration
+	rtoNs    atomic.Int64
+	rttvarNs atomic.Int64
+	srttNs   atomic.Int64
 
 	// statResends counts frames retransmitted over the connection lifetime.
 	statResends atomic.Int64
@@ -168,20 +172,32 @@ func newConnection(sock *unet.Socket, fd int, remote unet.Address, connID uint64
 	c.rttMs.Store(-1)
 	c.rtoNs.Store(int64(cfg.retransmitTmout))
 
-	// Resolve the in-flight cap. Without an explicit WithMaxBytesInFlight,
+	// Resolve the in-flight caps. Without an explicit WithMaxBytesInFlight,
 	// prefer the kernel's actually-granted receive buffer (getsockopt returns
 	// the doubled — and, crucially, rmem_max-clamped — real capacity) over
 	// the configured request as the estimate of what a peer provisioned like
-	// us can absorb, and keep a 25% margin under it: retransmitted duplicates
-	// ride on top of the cap (bytesInFlight counts unique unACKed bytes, not
-	// wire bytes), so a cap equal to the buffer lets a single drop overflow
-	// it and sustain the drop→retransmit collapse documented on
-	// WithMaxBytesInFlight. On an unclamped system this equals
-	// effectiveMaxInFlight's 1.5×recvBufSize fallback.
-	c.maxInFlightBytes = int64(cfg.effectiveMaxInFlight())
+	// us can absorb. Two caps are derived; inFlightCap picks by measured
+	// RTT:
+	//
+	//   - LAN (short RTT): granted/2 — the un-doubled request. The kernel
+	//     doubles SO_RCVBUF requests precisely because it charges arriving
+	//     data at skb truesize (payload plus bookkeeping overhead), so the
+	//     buffer's usable PAYLOAD capacity is roughly the request; on a
+	//     near-zero-RTT path the entire window can end up resident in the
+	//     receive buffer, so the cap must fit inside that.
+	//   - WAN (real RTT): granted − granted/4. Most of the window is stored
+	//     on the wire, not in the buffer, so the cap can approach the full
+	//     granted size — while the 25% margin covers retransmitted
+	//     duplicates, which ride ON TOP of the cap (bytesInFlight counts
+	//     unique unACKed bytes, not wire bytes) and would otherwise let a
+	//     single drop overflow the buffer and sustain the drop→retransmit
+	//     collapse documented on WithMaxBytesInFlight.
+	c.inFlightCapLan = int64(cfg.effectiveMaxInFlight())
+	c.inFlightCapWan = c.inFlightCapLan
 	if cfg.maxInFlight == 0 {
 		if granted, err := syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF); err == nil && granted > 0 {
-			c.maxInFlightBytes = int64(granted - granted/4)
+			c.inFlightCapLan = int64(granted / 2)
+			c.inFlightCapWan = int64(granted - granted/4)
 		}
 	}
 
@@ -397,6 +413,17 @@ func (c *Connection) Close() error {
 	// point (Shutdown happens below), so this reaches flushSendLocked fine.
 	c.sendControlFrame(frameGoAway, 0, 0)
 
+	// On the io_uring path that send is asynchronous — drain it before the
+	// Shutdown below, or the shutdown races the io-wq worker and the GOAWAY
+	// (and any other still-in-flight frames) dies with the socket, leaving
+	// the peer to find out via keepalive timeout instead.
+	c.sendMu.Lock()
+	if c.uring != nil {
+		c.uring.waitGen(0)
+		c.uring.waitGen(1)
+	}
+	c.sendMu.Unlock()
+
 	close(c.closeCh)
 
 	// Close all streams.
@@ -474,20 +501,21 @@ func (c *Connection) sendDataFrame(streamID, seq uint32, payload []byte) error {
 	return c.commitSendSlotZeroCopy(idx, hdrLen, data)
 }
 
-// sendFecFrame sends a parity frame covering count DATA frames strided G
-// apart starting at base (seqs base, base+G, ..., base+(count-1)*G — see
-// Stream.fecFoldLocked for why groups interleave). The base seq rides in
-// the header's seq field. Unreliable by design: parity is itself
+// sendFecFrame sends a parity frame covering count DATA frames starting at
+// base: strided G apart for frameFEC "column" groups (seqs base, base+G,
+// ..., base+(count-1)*G — see Stream.fecFoldLocked for why groups
+// interleave), consecutive for frameFECRow "row" groups. The base seq rides
+// in the header's seq field. Unreliable by design: parity is itself
 // redundancy, so a lost parity frame just means that group has no FEC
 // protection and recovery falls back to NACK/timeout. xorData is copied
 // into the send slot's own buffer (it's the stream's live accumulator).
-func (c *Connection) sendFecFrame(streamID, base uint32, count, xorLen int, xorData []byte) error {
+func (c *Connection) sendFecFrame(ftype uint8, streamID, base uint32, count, xorLen int, xorData []byte) error {
 	buf, idx, err := c.acquireSendSlot()
 	if err != nil {
 		return err
 	}
 	meta := uint32(count)<<16 | uint32(xorLen)
-	encodeHeader(buf, frameFEC, streamID, base, uint32(fecMetaLen+len(xorData)))
+	encodeHeader(buf, ftype, streamID, base, uint32(fecMetaLen+len(xorData)))
 	binary.BigEndian.PutUint32(buf[frameHeaderSize:], meta)
 	copy(buf[frameHeaderSize+fecMetaLen:], xorData)
 	return c.commitSendSlot(idx, frameHeaderSize+fecMetaLen+len(xorData))
@@ -513,17 +541,26 @@ func (c *Connection) sendReliableFrame(ftype uint8, streamID, seq uint32, payloa
 
 // sendWindowUpdate informs the peer of the absolute (cumulative) offset it
 // is now allowed to send up to on a stream. Sent unreliably and never
-// retransmitted — see windowUpdatePayload for why that's safe.
+// retransmitted — see windowUpdatePayload for why that's safe; on top of
+// that, the current watermark is re-advertised with every ACK flush (see
+// flushPendingAcksLocked), so even a lost update only starves the sender's
+// window until the next receive batch.
 func (c *Connection) sendWindowUpdate(streamID uint32, offset uint64) error {
+	if err := c.queueWindowUpdate(streamID, offset); err != nil {
+		return err
+	}
+	return c.flushSend()
+}
+
+// queueWindowUpdate queues a WINDOW_UPDATE frame without flushing.
+func (c *Connection) queueWindowUpdate(streamID uint32, offset uint64) error {
 	buf, idx, err := c.acquireSendSlot()
 	if err != nil {
 		return err
 	}
-	n := encodeFrame(buf, frameWindowUpdate, streamID, 0, windowUpdatePayload(offset))
-	if err := c.commitSendSlot(idx, n); err != nil {
-		return err
-	}
-	return c.flushSend()
+	encodeHeader(buf, frameWindowUpdate, streamID, 0, 8)
+	binary.BigEndian.PutUint64(buf[frameHeaderSize:], offset)
+	return c.commitSendSlot(idx, frameHeaderSize+8)
 }
 
 // sendControlFrame sends a control frame (no payload) immediately.
@@ -563,10 +600,38 @@ func (c *Connection) sendNackFrame(streamID uint32, seqs []uint32) error {
 	return c.flushSend()
 }
 
+// stubbornResendThreshold is the resend attempt from which each further
+// retransmission is sent as TWO copies in separate datagrams. A frame on
+// its second-or-later resend has already had a retransmission lost, and
+// every further loss costs another full recovery cycle (grace + RTT, or a
+// whole RTO) during which the frame stalls in-order delivery — the longest
+// head-of-line stalls a lossy stream suffers. Doubling only these frames
+// adds negligible bandwidth (they're the loss-rate-squared tail) while
+// squaring down the chance of yet another cycle.
+const stubbornResendThreshold = 2
+
 // queueResendFrame queues one pending frame for retransmission, zero-copy
 // from the retransmit arena and GSO-packed with other resends when packing
-// is on. Callers flush after queuing a batch.
+// is on. Stubborn frames (see stubbornResendThreshold) are queued twice, in
+// separate datagrams — two copies packed into one GSO super-packet would be
+// dropped together, defeating the redundancy. Callers flush after queuing a
+// batch.
 func (c *Connection) queueResendFrame(e retransmitEntry) error {
+	if err := c.queueResendCopy(e); err != nil {
+		return err
+	}
+	if e.retries < stubbornResendThreshold {
+		return nil
+	}
+	if c.gsoMaxFrames >= 2 {
+		c.sendMu.Lock()
+		c.closePackLocked() // start a fresh GSO message: separate datagram for the second copy
+		c.sendMu.Unlock()
+	}
+	return c.queueResendCopy(e)
+}
+
+func (c *Connection) queueResendCopy(e retransmitEntry) error {
 	if c.gsoMaxFrames >= 2 {
 		c.sendMu.Lock()
 		err := c.queueFrameGSOLocked(e.ftype, e.streamID, e.seq, e.data)
@@ -784,8 +849,22 @@ func (c *Connection) flushSendLocked() error {
 // like network reordering, the receiver's reorder buffer absorbs it and the
 // idempotent ACK/window frames are unaffected. Caller holds sendMu.
 func (c *Connection) flushSendUringLocked(n int) error {
+	// Small flushes (pings, ACKs, window updates, a lone tail frame) run
+	// inline during the submit syscall — identical latency to sendmmsg —
+	// because the io-wq wakeup that buys bulk batches their pipelining is
+	// pure added latency for a latency-sensitive control frame. Only
+	// byte-heavy batches go async.
+	const asyncBytesMin = 16 << 10
+	total := 0
+	for i := 0; i < n; i++ {
+		total += c.sendLens[i]
+	}
+	var sqeFlags uint8
+	if total >= asyncBytesMin {
+		sqeFlags = iosqeAsync
+	}
 	set := c.uringSet
-	if errno := c.uring.submitSendmsg(c.fd, c.sendEP.Hdrs[:n], set); errno != 0 {
+	if errno := c.uring.submitSendmsg(c.fd, c.sendEP.Hdrs[:n], set, sqeFlags); errno != 0 {
 		return errno
 	}
 	c.uringSet ^= 1
@@ -1002,7 +1081,11 @@ func (c *Connection) dispatchFrameLocked(f frame) {
 		}
 		c.handleData(f)
 	case frameFEC:
-		c.handleFec(f)
+		c.handleFec(f, false)
+	case frameFECRow:
+		if c.cfg.fec2D {
+			c.handleFec(f, true)
+		}
 	case frameStreamFIN:
 		c.handleStreamFIN(f)
 	case frameStreamReset:
@@ -1042,17 +1125,32 @@ func (c *Connection) flushPendingAcks() {
 	c.recvMu.Unlock()
 }
 
+// maxSnapshotFrames caps how many ACK frames one stream's snapshot may
+// spread across per flush. One frame's seq list can be smaller than a
+// heavily reorder-buffered stream's out-of-order set (a big-window lossy
+// link can buffer thousands of frames past a gap); seqs that don't fit go
+// un-ACKed and get pointlessly retransmitted at the RTO — duplicate traffic
+// exactly when the link is already struggling. Four frames cover ~8k seqs
+// per flush and the snapshot's randomized map iteration rotates coverage,
+// so anything still unlisted is acknowledged within a few batches, well
+// inside the RTO.
+const maxSnapshotFrames = 4
+
 // flushPendingAcksLocked sends any accumulated ACKs, chunked to fit the wire
 // format. Called after each receive batch, holding recvMu.
 //
 // Live streams marked dirty this batch get a snapshot ACK — their full
 // receive state (cumulative watermark + out-of-order seqs), idempotent and
-// re-advertised every flush so lost ACK frames self-heal. Explicit seq
-// lists (cumulative=0) remain for the paths with no live stream state to
-// snapshot: dead-stream/tombstone acking and RESET/late-FIN handling. The
-// per-stream slices/buffers are truncated in place and retained so
-// steady-state flushing allocates nothing; removeStream deletes a stream's
-// slots when it goes away.
+// re-advertised every flush so lost ACK frames self-heal — chunked across
+// up to maxSnapshotFrames frames (each repeating the cumulative watermark,
+// which the sender's swept-once accounting makes free), plus a
+// WINDOW_UPDATE re-advertising the stream's current flow-control watermark
+// so lost grants self-heal the same way. Explicit seq lists (cumulative=0)
+// remain for the paths with no live stream state to snapshot:
+// dead-stream/tombstone acking and RESET/late-FIN handling. The per-stream
+// slices/buffers are truncated in place and retained so steady-state
+// flushing allocates nothing; removeStream deletes a stream's slots when
+// it goes away.
 func (c *Connection) flushPendingAcksLocked() {
 	maxAcks := maxAckSeqsPerFrame(c.cfg.maxPayload)
 	queued := false
@@ -1062,9 +1160,21 @@ func (c *Connection) flushPendingAcksLocked() {
 		s := c.streams[streamID]
 		c.streamMu.RUnlock()
 		if s != nil {
-			cum, seqs := s.ackSnapshot(c.ackSnapBuf, maxAcks)
+			cum, seqs, granted := s.ackSnapshot(c.ackSnapBuf, maxSnapshotFrames*maxAcks)
 			c.ackSnapBuf = seqs[:0]
-			c.queueACKFrame(streamID, cum, seqs)
+			rest := seqs
+			for {
+				n := len(rest)
+				if n > maxAcks {
+					n = maxAcks
+				}
+				c.queueACKFrame(streamID, cum, rest[:n])
+				rest = rest[n:]
+				if len(rest) == 0 {
+					break
+				}
+			}
+			c.queueWindowUpdate(streamID, uint64(granted))
 			queued = true
 		}
 		delete(c.sAckDirty, streamID)
@@ -1193,10 +1303,11 @@ func (c *Connection) handleStreamFIN(f frame) {
 	c.markAckDirty(f.streamID)
 }
 
-// handleFec routes a parity frame to its stream for possible zero-RTT loss
-// recovery (see Stream.applyFec). Parity for unknown/dead streams is
-// silently dropped — it's pure redundancy. Caller holds recvMu.
-func (c *Connection) handleFec(f frame) {
+// handleFec routes a parity frame (column, or row under WithFEC2D) to its
+// stream for possible zero-RTT loss recovery (see Stream.applyFec). Parity
+// for unknown/dead streams is silently dropped — it's pure redundancy.
+// Caller holds recvMu.
+func (c *Connection) handleFec(f frame, row bool) {
 	if c.cfg.fecGroup == 0 || len(f.payload) < fecMetaLen {
 		return
 	}
@@ -1212,7 +1323,7 @@ func (c *Connection) handleFec(f frame) {
 	if s == nil {
 		return
 	}
-	if s.applyFec(f.seq, count, xorLen, f.payload[fecMetaLen:]) {
+	if s.applyFec(row, f.seq, count, xorLen, f.payload[fecMetaLen:]) {
 		c.statFecRecovered.Add(1)
 		// The reconstruction advanced receive state: advertise it.
 		c.markAckDirty(f.streamID)
@@ -1309,16 +1420,18 @@ func (c *Connection) handleACK(f frame) {
 // path: the peer only NACKs once it has direct evidence of loss (later
 // frames arrived and the gap persisted past the reorder grace), so recovery
 // happens in about one RTT instead of waiting out the timer. Seqs that are
-// already acknowledged or unknown are silently skipped.
+// already acknowledged, unknown, or resent within the last ¾·SRTT (stale
+// evidence — see getForResend) are silently skipped.
 func (c *Connection) handleNack(f frame) {
 	_, seqs, err := decodeSeqListFrame(f, c.ackScratch)
 	if err != nil {
 		return // discard malformed NACK
 	}
-	c.ackScratch = seqs[:0] // retain capacity (shared with handleACK; both run under recvMu)
+	c.ackScratch = seqs[:0]  // retain capacity (shared with handleACK; both run under recvMu)
+	minAge := c.srtt * 3 / 4 // srtt: handleNack and updateRTO both run under recvMu
 	resent := 0
 	for _, seq := range seqs {
-		e, ok := c.retransmit.getForResend(f.streamID, seq)
+		e, ok := c.retransmit.getForResend(f.streamID, seq, minAge)
 		if !ok {
 			continue
 		}
@@ -1362,6 +1475,39 @@ func (c *Connection) removeStream(id uint32) {
 	}
 }
 
+// setSockBuf returns a unet socket option that sets a socket buffer size
+// (SO_RCVBUF/SO_SNDBUF) best-effort: the privileged FORCE variant is tried
+// first (with CAP_NET_ADMIN it ignores net.core.{r,w}mem_max entirely),
+// falling back to the plain option, which the kernel silently clamps to
+// the sysctl limit. Unlike unet's SetOptRcvBuf, a smaller-than-requested
+// grant is NOT an error: every limit that must respect the real buffer
+// size — most importantly the in-flight cap — is derived from the granted
+// value read back via getsockopt (see newConnection), so requesting
+// generously and taking what the system allows is safe by construction,
+// and lets the defaults ask for large buffers without failing outright on
+// conservatively-tuned systems.
+func setSockBuf(opt, forceOpt, size int) unet.SockOpt {
+	return func(s *unet.Socket) error {
+		fd, ok := s.Fd.Get()
+		if !ok {
+			return ErrClosed
+		}
+		if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, forceOpt, size); err == nil {
+			return nil
+		}
+		syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, opt, size) // kernel clamps to the sysctl cap
+		return nil
+	}
+}
+
+func setRcvBuf(size int) unet.SockOpt {
+	return setSockBuf(syscall.SO_RCVBUF, syscall.SO_RCVBUFFORCE, size)
+}
+
+func setSndBuf(size int) unet.SockOpt {
+	return setSockBuf(syscall.SO_SNDBUF, syscall.SO_SNDBUFFORCE, size)
+}
+
 // bindToDevice returns a unet socket option that binds the socket to a
 // network interface via SO_BINDTODEVICE. Requires CAP_NET_RAW or root.
 func bindToDevice(ifname string) unet.SockOpt {
@@ -1393,8 +1539,8 @@ func Dial(ctx context.Context, addr string, opts ...Option) (*Connection, error)
 		ResolveFarAddr(host, port).
 		ResolveNearAddr("0.0.0.0", 0).
 		ConstructUdp().
-		SetOptRcvBuf(cfg.recvBufSize).
-		SetOptSndBuf(cfg.sendBufSize).
+		SetOpt(setRcvBuf(cfg.recvBufSize)).
+		SetOpt(setSndBuf(cfg.sendBufSize)).
 		SetOpt(bindToDevice(cfg.bindDevice), cfg.bindDevice == "")
 
 	if cfg.socketOpts != nil {
@@ -1520,12 +1666,65 @@ func (c *Connection) updateRTO(sample time.Duration) {
 		rto = min
 	}
 	c.rtoNs.Store(int64(rto))
+	c.rttvarNs.Store(int64(c.rttvar))
+	c.srttNs.Store(int64(c.srtt))
+}
+
+// inFlightCap returns the current per-stream bound on sent-but-unACKed
+// bytes. RTT decides which derived cap applies because RTT decides WHERE
+// the window physically lives: on a short-RTT path (loopback, LAN) the
+// wire stores almost nothing, so everything the sender has outstanding
+// piles into the receiver's socket buffer and the cap must fit its usable
+// payload capacity — while on a long-RTT path most of the window is in
+// flight, and a cap sized only to the buffer leaves the link's
+// bandwidth-delay product unreachable. SRTT starts at 0 (no samples), so a
+// connection begins on the conservative LAN cap and steps up within about
+// one round trip of real traffic. Safe to call from any goroutine.
+func (c *Connection) inFlightCap() int64 {
+	// 10ms cleanly separates the regimes: a loaded LAN's queue-inflated
+	// samples stay well under it (the estimator keeps the MINIMUM sample
+	// per ACK batch, approximating propagation delay), and any path with
+	// enough RTT for wire storage to matter sits well above it.
+	const wanRTT = 10 * time.Millisecond
+	if time.Duration(c.srttNs.Load()) >= wanRTT {
+		return c.inFlightCapWan
+	}
+	return c.inFlightCapLan
 }
 
 // currentRTO returns the connection's current adaptive retransmit timeout.
 // Safe to call from any goroutine without recvMu.
 func (c *Connection) currentRTO() time.Duration {
 	return time.Duration(c.rtoNs.Load())
+}
+
+// reorderGrace returns how long a receive gap must persist before it's
+// treated as loss (NACKed) rather than in-flight reordering. The reorder
+// window is characterized by the path's jitter — which rttvar already
+// measures — not by the RTO: deriving the grace from the RTO (whose floor
+// exists to prevent spurious timer retransmits, a much costlier mistake)
+// made every non-FEC-recoverable loss wait out a large fixed delay before
+// recovery could even start. 2×rttvar comfortably covers jitter-induced
+// reordering; the RTO/reorderGraceFraction ceiling preserves the old
+// behavior until real samples exist (rttvar==0) and on wildly-jittery
+// paths, and the small floor keeps a quiet link's near-zero rttvar from
+// NACKing every io_uring- or NIC-level micro-reordering. A mistaken NACK
+// costs one duplicate frame, which the receiver discards — cheap next to a
+// stalled gap.
+func (c *Connection) reorderGrace() time.Duration {
+	rv := c.rttvarNs.Load()
+	max := c.currentRTO() / reorderGraceFraction
+	if rv == 0 {
+		return max
+	}
+	g := 2 * time.Duration(rv)
+	if min := 2 * time.Millisecond; g < min {
+		g = min
+	}
+	if g > max {
+		g = max
+	}
+	return g
 }
 
 func (c *Connection) SendPing(streamId uint32, seq uint32) error {

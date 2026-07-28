@@ -52,8 +52,8 @@ func Listen(addr string, opts ...Option) (*Listener, error) {
 		ConstructUdp().
 		SetOptReusePort().
 		SetOptReuseAddr().
-		SetOptRcvBuf(cfg.recvBufSize).
-		SetOptSndBuf(cfg.sendBufSize).
+		SetOpt(setRcvBuf(cfg.recvBufSize)).
+		SetOpt(setSndBuf(cfg.sendBufSize)).
 		SetOpt(bindToDevice(cfg.bindDevice), cfg.bindDevice == "")
 
 	if cfg.socketOpts != nil {
@@ -217,8 +217,8 @@ func (l *Listener) createConnection(
 		ConstructUdp().
 		SetOptReusePort().
 		SetOptReuseAddr().
-		SetOptRcvBuf(l.cfg.recvBufSize).
-		SetOptSndBuf(l.cfg.sendBufSize).
+		SetOpt(setRcvBuf(l.cfg.recvBufSize)).
+		SetOpt(setSndBuf(l.cfg.sendBufSize)).
 		SetOpt(bindToDevice(l.cfg.bindDevice), l.cfg.bindDevice == "")
 
 	if l.cfg.socketOpts != nil {

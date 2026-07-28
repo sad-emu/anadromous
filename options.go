@@ -9,10 +9,19 @@ import (
 )
 
 const (
-	defaultMaxStreams        = 1024
-	defaultStreamBufSize     = 128 * 1024 * 1024 // 128 MB per-stream read buffer
-	defaultRecvBufSize       = 4 * 1024 * 1024
-	defaultSendBufSize       = 4 * 1024 * 1024
+	defaultMaxStreams    = 1024
+	defaultStreamBufSize = 128 * 1024 * 1024 // 128 MB per-stream read buffer
+	// Socket buffers are requested best-effort (see setSockBuf): the kernel
+	// clamps to net.core.{r,w}mem_max without failing, and everything that
+	// must respect the real size — the in-flight cap above all — derives
+	// from the granted value. So the defaults ask big: on a provisioned
+	// system (rmem_max >= 16MB, or CAP_NET_ADMIN) a connection gets 32MB of
+	// effective socket buffer and a 24MB default in-flight window —
+	// absorbing multi-millisecond receiver stalls and lifting the default
+	// BDP ceiling on long-RTT paths — while a conservatively-tuned system
+	// just grants what it allows.
+	defaultRecvBufSize       = 16 * 1024 * 1024
+	defaultSendBufSize       = 16 * 1024 * 1024
 	defaultBatchSize         = 64 // number of messages per recvmmsg/sendmmsg batch
 	defaultHandshakeTimout   = 5 * time.Second
 	defaultKeepAlive         = 10 * time.Second
@@ -34,8 +43,9 @@ type config struct {
 	bindDevice      string // SO_BINDTODEVICE interface name, empty = unbound
 	enableGSO       bool
 	enableIOUring   bool
-	maxInFlight     int // per-stream cap on sent-but-unACKed bytes
-	fecGroup        int // DATA frames per FEC parity frame; 0 disables FEC
+	maxInFlight     int  // per-stream cap on sent-but-unACKed bytes
+	fecGroup        int  // DATA frames per FEC parity frame; 0 disables FEC
+	fec2D           bool // add row parity (second FEC dimension) — see WithFEC2D
 	socketOpts      func(*unet.Socket)
 }
 
@@ -113,12 +123,17 @@ func WithStreamBufferSize(n int) Option {
 	return func(c *config) { c.streamBufSize = n }
 }
 
-// WithRecvBufferSize sets the UDP socket receive buffer (SO_RCVBUF).
+// WithRecvBufferSize sets the UDP socket receive buffer (SO_RCVBUF)
+// request. Best-effort: without CAP_NET_ADMIN the kernel clamps the request
+// to net.core.rmem_max rather than failing, and the connection's derived
+// limits (the in-flight cap in particular) follow the granted size, not the
+// request — so raising this only takes full effect once rmem_max allows it.
 func WithRecvBufferSize(n int) Option {
 	return func(c *config) { c.recvBufSize = n }
 }
 
-// WithSendBufferSize sets the UDP socket send buffer (SO_SNDBUF).
+// WithSendBufferSize sets the UDP socket send buffer (SO_SNDBUF) request.
+// Best-effort like WithRecvBufferSize (clamped to net.core.wmem_max).
 func WithSendBufferSize(n int) Option {
 	return func(c *config) { c.sendBufSize = n }
 }
@@ -253,6 +268,25 @@ func WithFEC(groupSize int) Option {
 			c.fecGroup = groupSize
 		}
 	}
+}
+
+// WithFEC2D adds a second, orthogonal FEC dimension on top of WithFEC: as
+// well as the strided "column" parity groups, a parity frame is emitted
+// over every G consecutive DATA frames (a "row"). Columns absorb burst
+// loss (a dropped GSO super-packet puts at most one loss per column); rows
+// recover the random double losses that defeat a single column — and the
+// two dimensions peel iteratively, each recovery potentially unblocking
+// the other, so most multi-loss patterns short of a full G×G stopping set
+// reconstruct with zero round trips. Costs a second 1/G of bandwidth
+// (12.5% more at the default group size, 25% total) — the same
+// spare-bandwidth-for-latency bargain as WithFEC, for links lossy enough
+// that double losses per group are common (e.g. ≥5-10% loss).
+//
+// BOTH ENDS SHOULD USE THE SAME SETTING: a receiver without it ignores row
+// parity frames (wasting their bandwidth), and a receiver with it folds
+// row state that a non-sending peer never uses. Requires WithFEC > 0.
+func WithFEC2D(enabled bool) Option {
+	return func(c *config) { c.fec2D = enabled }
 }
 
 // WithSocketOptions provides an escape hatch for setting arbitrary unet socket options.

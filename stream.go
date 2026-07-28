@@ -19,15 +19,17 @@ func xorInto(dst, src []byte) {
 	subtle.XORBytes(dst[:len(src)], dst[:len(src)], src)
 }
 
-// reorderGraceFraction sets how long a gap must persist — evidenced by a
-// second out-of-order arrival for the same still-missing sequence, spaced at
-// least retransmitTmout/reorderGraceFraction apart — before it's treated as
-// loss worth a fast retransmit. A single out-of-order arrival is ordinary
-// evidence of packet reordering, not proof of loss (netem-style "packet
-// jumps the queue" reordering typically resolves within one jitter window),
-// so NACKing on first sight of a gap mostly fires on reordering rather than
-// real loss and wastes bandwidth on duplicate resends over an already lossy
-// link. The same duration throttles repeat NACKs for a gap that stays open.
+// reorderGraceFraction bounds how long a gap must persist — evidenced by a
+// second out-of-order arrival for the same still-missing sequence — before
+// it's treated as loss worth a fast retransmit. A single out-of-order
+// arrival is ordinary evidence of packet reordering, not proof of loss
+// (netem-style "packet jumps the queue" reordering typically resolves
+// within one jitter window), so NACKing on first sight of a gap mostly
+// fires on reordering rather than real loss and wastes bandwidth on
+// duplicate resends over an already lossy link. The same duration throttles
+// repeat NACKs for a gap that stays open. RTO/reorderGraceFraction is only
+// the ceiling (and the pre-sample default): once RTT samples exist the
+// grace adapts to the measured jitter instead — see Connection.reorderGrace.
 const reorderGraceFraction = 4
 
 // initialStreamWindow is the flow-control credit (and receive ring size) a
@@ -87,8 +89,10 @@ type Stream struct {
 	nackScratch    []uint32                    // reused gap-list buffer for NACK frames
 	createdAt      time.Time                   // stream creation time; bounds the ramp-up window
 	lastGrowAt     time.Time                   // when the ring last grew, paces the ramp-up
-	fecAcc         map[uint32]*fecAccum        // FEC receiver: per-group running XOR of delivered members, keyed by group base
-	fecPending     map[uint32]fecPendingParity // FEC receiver: parity frames awaiting more group members, keyed by group base
+	fecAcc         map[uint32]*fecAccum        // FEC receiver: per-column-group running XOR of delivered members, keyed by group base
+	fecPending     map[uint32]fecPendingParity // FEC receiver: column parity frames awaiting more group members, keyed by group base
+	fecAccRow      map[uint32]*fecAccum        // FEC receiver: row-group counterpart of fecAcc (WithFEC2D)
+	fecPendingRow  map[uint32]fecPendingParity // FEC receiver: row-group counterpart of fecPending (WithFEC2D)
 	readDeadline   time.Time
 
 	// write side — guarded by writeMu.
@@ -104,8 +108,11 @@ type Stream struct {
 
 	// FEC sender accumulators (writeMu): one lane per residue class of
 	// seq mod G, so each parity group's members are strided G apart — see
-	// Stream.fecFoldLocked.
-	fecLanes []fecLane
+	// Stream.fecFoldLocked. Under WithFEC2D, fecRowLane additionally folds
+	// every chunk in sequence, emitting a parity over each G consecutive
+	// seqs (the orthogonal "row" dimension).
+	fecLanes   []fecLane
+	fecRowLane fecLane
 }
 
 // fecLane accumulates one interleaved parity group: the running XOR of its
@@ -302,8 +309,16 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 // on the wire: a burst loss of up to G consecutive frames (e.g. one dropped
 // GSO super-packet) puts at most ONE loss in each group, keeping every
 // affected group single-loss-recoverable — consecutive grouping would
-// instead concentrate the whole burst in one unrecoverable group. Caller
-// holds writeMu.
+// instead concentrate the whole burst in one unrecoverable group.
+//
+// Under WithFEC2D every chunk is additionally folded into the rolling row
+// lane, whose groups are the G consecutive seqs [kG, (k+1)G). Rows are the
+// orthogonal complement of the strided columns: two losses in one column
+// group land in two different rows (each often recoverable on its own), and
+// each recovery can unblock the other dimension in turn — see the peeling
+// retry in Stream.fecRetryBaseLocked. Because writes fold strictly
+// sequentially, row bases stay aligned to multiples of G from seq 0, which
+// is what lets the receiver key row groups statically. Caller holds writeMu.
 func (s *Stream) fecFoldLocked(seq uint32, chunk []byte) {
 	g := s.conn.cfg.fecGroup
 	if g <= 0 {
@@ -312,7 +327,15 @@ func (s *Stream) fecFoldLocked(seq uint32, chunk []byte) {
 	if s.fecLanes == nil {
 		s.fecLanes = make([]fecLane, g)
 	}
-	ln := &s.fecLanes[seq%uint32(g)]
+	s.foldLaneLocked(&s.fecLanes[seq%uint32(g)], seq, chunk, frameFEC)
+	if s.conn.cfg.fec2D {
+		s.foldLaneLocked(&s.fecRowLane, seq, chunk, frameFECRow)
+	}
+}
+
+// foldLaneLocked folds one chunk into a lane, emitting when the group
+// fills. Caller holds writeMu.
+func (s *Stream) foldLaneLocked(ln *fecLane, seq uint32, chunk []byte, ftype uint8) {
 	if ln.xor == nil {
 		ln.xor = make([]byte, s.conn.cfg.dataCap())
 	}
@@ -325,18 +348,18 @@ func (s *Stream) fecFoldLocked(seq uint32, chunk []byte) {
 	}
 	ln.lenXor ^= uint32(len(chunk))
 	ln.count++
-	if ln.count >= g {
-		s.emitLaneLocked(ln)
+	if ln.count >= s.conn.cfg.fecGroup {
+		s.emitLaneLocked(ln, ftype)
 	}
 }
 
 // emitLaneLocked sends a lane's (possibly partial) parity frame and resets
 // the lane. Caller holds writeMu.
-func (s *Stream) emitLaneLocked(ln *fecLane) {
+func (s *Stream) emitLaneLocked(ln *fecLane, ftype uint8) {
 	if ln.count == 0 {
 		return
 	}
-	s.conn.sendFecFrame(s.id, ln.base, ln.count, int(ln.lenXor), ln.xor[:ln.maxLen])
+	s.conn.sendFecFrame(ftype, s.id, ln.base, ln.count, int(ln.lenXor), ln.xor[:ln.maxLen])
 	clear(ln.xor[:ln.maxLen]) // compiles to memclr — an indexed byte loop here costs ~7% of whole-connection CPU
 	ln.maxLen, ln.lenXor, ln.count = 0, 0, 0
 }
@@ -362,10 +385,10 @@ func (s *Stream) bytesInFlightLocked() int64 {
 }
 
 // inFlightCap is the bound Write enforces on bytesInFlight: the configured
-// or derived cap (resolved once in newConnection), never more than the
-// stream buffer size.
+// or RTT-selected derived cap (see Connection.inFlightCap), never more
+// than the stream buffer size.
 func (s *Stream) inFlightCap() int64 {
-	cap := s.conn.maxInFlightBytes
+	cap := s.conn.inFlightCap()
 	if max := int64(s.maxBufSize()); cap > max {
 		cap = max
 	}
@@ -406,8 +429,9 @@ func (s *Stream) CloseWrite() error {
 	// on the wire) so the stream's final frames get FEC protection too; the
 	// FIN itself is outside FEC (it's reliably retransmitted anyway).
 	for i := range s.fecLanes {
-		s.emitLaneLocked(&s.fecLanes[i])
+		s.emitLaneLocked(&s.fecLanes[i], frameFEC)
 	}
+	s.emitLaneLocked(&s.fecRowLane, frameFECRow)
 	s.writeCond.Broadcast()
 	s.writeMu.Unlock()
 
@@ -434,6 +458,7 @@ func (s *Stream) abortWriteLocked(code uint64, sendReset bool) {
 	seq := s.writeSeq
 	// Abandon the in-progress parity groups — the peer no longer wants them.
 	s.fecLanes = nil
+	s.fecRowLane = fecLane{}
 	s.writeCond.Broadcast()
 	s.writeMu.Unlock()
 
@@ -473,6 +498,8 @@ func (s *Stream) discardReadStateLocked() {
 	s.reorderBytes = 0
 	s.fecAcc = nil
 	s.fecPending = nil
+	s.fecAccRow = nil
+	s.fecPendingRow = nil
 }
 
 // SetDeadline sets both read and write deadlines.
@@ -572,8 +599,7 @@ func (s *Stream) deliverLocked(seq uint32, payload []byte, isFin bool) (ack bool
 		if s.conn.cfg.fecGroup > 0 {
 			// A buffered member is visible to reconstruction (the reorder
 			// map is consulted directly), so it may complete a pending group.
-			base, _ := s.fecGroupOf(seq)
-			s.fecRetryBaseLocked(base)
+			s.fecRetrySeqLocked(seq)
 		}
 		return true
 	}
@@ -592,10 +618,21 @@ func (s *Stream) deliverLocked(seq uint32, payload []byte, isFin bool) (ack bool
 	s.maybeEOFLocked()
 	s.readCond.Broadcast()
 	if s.conn.cfg.fecGroup > 0 {
-		base, _ := s.fecGroupOf(seq)
-		s.fecRetryBaseLocked(base)
+		s.fecRetrySeqLocked(seq)
 	}
 	return true
+}
+
+// fecRetrySeqLocked re-attempts the pending parities of every group seq
+// belongs to — its column group, and its row group under WithFEC2D. Caller
+// holds readMu.
+func (s *Stream) fecRetrySeqLocked(seq uint32) {
+	base, _ := s.fecGroupOf(seq)
+	s.fecRetryBaseLocked(false, base)
+	if s.conn.cfg.fec2D {
+		rowBase, _ := s.fecRowOf(seq)
+		s.fecRetryBaseLocked(true, rowBase)
+	}
 }
 
 // deliverReset handles an incoming RESET frame: the peer aborted its write
@@ -735,9 +772,9 @@ type fecAccum struct {
 	maxLen int    // longest folded member
 }
 
-// fecGroupOf maps a DATA seq to its parity group's base seq and its member
-// index within the group. The sender's lanes make this static: lane l =
-// seq%G receives every G-th seq and emits every G members without ever
+// fecGroupOf maps a DATA seq to its column parity group's base seq and its
+// member index within the group. The sender's lanes make this static: lane
+// l = seq%G receives every G-th seq and emits every G members without ever
 // resetting mid-stream, so the group covering seq is
 // base = (seq/G²)·G² + seq%G with member index (seq/G) mod G.
 func (s *Stream) fecGroupOf(seq uint32) (base uint32, idx int) {
@@ -746,27 +783,47 @@ func (s *Stream) fecGroupOf(seq uint32) (base uint32, idx int) {
 	return seq/span*span + seq%g, int(seq / g % g)
 }
 
+// fecRowOf is fecGroupOf's row-dimension counterpart: row groups are the G
+// consecutive seqs [kG, (k+1)G), statically keyed because the sender folds
+// strictly sequentially from seq 0.
+func (s *Stream) fecRowOf(seq uint32) (base uint32, idx int) {
+	g := uint32(s.conn.cfg.fecGroup)
+	return seq / g * g, int(seq % g)
+}
+
 // fecFoldRecvLocked folds a frame being delivered into the ring into its
-// group's running XOR. Caller holds readMu; only call when fecGroup > 0.
+// column group's running XOR — and its row group's too under WithFEC2D.
+// Caller holds readMu; only call when fecGroup > 0.
 func (s *Stream) fecFoldRecvLocked(seq uint32, data []byte) {
+	if len(data) > s.conn.cfg.dataCap() {
+		return // oversized (non-conforming peer); leave its groups unprotected
+	}
 	base, idx := s.fecGroupOf(seq)
-	acc := s.fecAcc[base]
+	s.fecAcc = s.fecFoldAccLocked(s.fecAcc, base, idx, data)
+	if s.conn.cfg.fec2D {
+		rowBase, rowIdx := s.fecRowOf(seq)
+		s.fecAccRow = s.fecFoldAccLocked(s.fecAccRow, rowBase, rowIdx, data)
+	}
+	s.fecSweepLocked()
+}
+
+// fecFoldAccLocked folds one member into the group accumulator keyed base
+// in accs, creating both as needed, and returns the (possibly newly
+// allocated) map. Caller holds readMu.
+func (s *Stream) fecFoldAccLocked(accs map[uint32]*fecAccum, base uint32, idx int, data []byte) map[uint32]*fecAccum {
+	acc := accs[base]
 	if acc == nil {
-		if len(data) > s.conn.cfg.dataCap() {
-			return // oversized (non-conforming peer); leave the group unprotected
-		}
-		if s.fecAcc == nil {
-			s.fecAcc = make(map[uint32]*fecAccum, 2*s.conn.cfg.fecGroup)
+		if accs == nil {
+			accs = make(map[uint32]*fecAccum, 2*s.conn.cfg.fecGroup)
 		}
 		buf := s.reorderGetLocked(s.conn.cfg.dataCap())
 		n := copy(buf, data) // pooled buffer holds stale bytes: seed with the first member...
 		clear(buf[n:])       // ...and zero the tail past it
-		s.fecAcc[base] = &fecAccum{xor: buf, folded: 1 << idx, lenXor: uint32(len(data)), maxLen: len(data)}
-		s.fecSweepLocked()
-		return
+		accs[base] = &fecAccum{xor: buf, folded: 1 << idx, lenXor: uint32(len(data)), maxLen: len(data)}
+		return accs
 	}
 	if acc.folded&(1<<idx) != 0 || len(data) > len(acc.xor) {
-		return // duplicate fold (can't happen — delivery is once per seq) or oversized
+		return accs // duplicate fold (can't happen — delivery is once per seq) or oversized
 	}
 	acc.folded |= 1 << idx
 	xorInto(acc.xor, data)
@@ -774,41 +831,57 @@ func (s *Stream) fecFoldRecvLocked(seq uint32, data []byte) {
 	if len(data) > acc.maxLen {
 		acc.maxLen = len(data)
 	}
+	return accs
 }
 
 // fecSweepLocked drops accumulators for groups whose every possible member
 // is already delivered — a parity arriving for them is answered by the
 // "readSeq past the last member" fast path in tryReconstructLocked without
-// consulting an accumulator. Called when a new group starts, so the map
-// stays at most ~one live group per lane plus a few just-finished ones.
+// consulting an accumulator. Cheap when the maps are small, so it runs per
+// fold; the maps stay at ~one live group per lane (columns) plus a couple
+// of rows.
 func (s *Stream) fecSweepLocked() {
 	g := uint32(s.conn.cfg.fecGroup)
-	if len(s.fecAcc) <= 2*int(g) {
-		return
+	if len(s.fecAcc) > 2*int(g) {
+		span := g * g
+		for base, acc := range s.fecAcc {
+			if base+span-g < s.readSeq { // last possible member is base+G²-G
+				s.reorderPutLocked(acc.xor)
+				delete(s.fecAcc, base)
+			}
+		}
 	}
-	span := g * g
-	for base, acc := range s.fecAcc {
-		if base+span-g < s.readSeq { // last possible member is base+G²-G
-			s.reorderPutLocked(acc.xor)
-			delete(s.fecAcc, base)
+	if len(s.fecAccRow) > 2*int(g) {
+		for base, acc := range s.fecAccRow {
+			if base+g-1 < s.readSeq { // last possible member is base+G-1
+				s.reorderPutLocked(acc.xor)
+				delete(s.fecAccRow, base)
+			}
 		}
 	}
 }
 
 // fecRetryBaseLocked re-attempts a buffered parity for one group after a
 // member of that group became available (delivered into the accumulator, or
-// inserted into the reorder map). Caller holds readMu.
-func (s *Stream) fecRetryBaseLocked(base uint32) {
-	p, ok := s.fecPending[base]
+// inserted into the reorder map). This is also the peeling engine for 2D
+// FEC: a frame recovered in one dimension is injected via deliverLocked,
+// whose own pass through the fold/retry hooks re-attempts the OTHER
+// dimension's pending parity, chaining recoveries. Caller holds readMu.
+func (s *Stream) fecRetryBaseLocked(row bool, base uint32) {
+	pending := s.fecPending
+	if row {
+		pending = s.fecPendingRow
+	}
+	p, ok := pending[base]
 	if !ok {
 		return
 	}
 	// Claim the entry before reconstructing so the injected frame's own
 	// pass through this hook can't double-process it.
-	delete(s.fecPending, base)
-	switch s.tryReconstructLocked(base, p.count, p.xorLen, p.data) {
+	delete(pending, base)
+	switch s.tryReconstructLocked(row, base, p.count, p.xorLen, p.data) {
 	case fecPendingMembers:
-		s.fecPending[base] = p // still waiting; put it back
+		pending[base] = p // still waiting; put it back
 	case fecRecovered:
 		s.conn.statFecRecovered.Add(1)
 		s.reorderPutLocked(p.data)
@@ -827,6 +900,14 @@ type fecPendingParity struct {
 	data   []byte // pooled copy
 }
 
+// fecPendingCap bounds each dimension's pending-parity buffer. Sized for
+// big-window lossy links: a 32MB window spans ~60 column groups, and at
+// ~10% loss a fifth of them are legitimately pending at once — a cap near
+// that count evicts parities that would still have recovered frames once
+// their members arrived. Worst case cost per stream per dimension is
+// fecPendingCap pooled frame-size buffers (~0.5MB at the defaults).
+const fecPendingCap = 64
+
 // Reconstruction outcomes for tryReconstructLocked.
 const (
 	fecUseless        = iota // group complete, unrecoverable, or parity invalid — parity can be dropped
@@ -834,65 +915,84 @@ const (
 	fecPendingMembers        // >1 member still in flight — worth retrying later
 )
 
-// applyFec processes a parity frame covering the strided DATA seqs
-// base, base+G, ..., base+(count-1)*G: if exactly one member is missing and
-// every other member's data is still available (in the reorder map or the
-// group's running-XOR accumulator), the missing frame is reconstructed by
-// XOR and injected as if it had arrived — zero-round-trip loss recovery. A
-// parity whose group still has several members in flight is buffered and
-// retried as members arrive. Returns whether a frame was recovered right
-// now. Idempotent: on a duplicate parity, nothing is missing anymore.
-func (s *Stream) applyFec(base uint32, count, xorLen int, xorData []byte) (recovered bool) {
+// applyFec processes a parity frame covering count DATA seqs from base —
+// strided G apart for column parity (row=false), consecutive for row parity
+// (row=true, WithFEC2D): if exactly one member is missing and every other
+// member's data is still available (in the reorder map or the group's
+// running-XOR accumulator), the missing frame is reconstructed by XOR and
+// injected as if it had arrived — zero-round-trip loss recovery. A parity
+// whose group still has several members in flight is buffered and retried
+// as members arrive. Returns whether a frame was recovered right now.
+// Idempotent: on a duplicate parity, nothing is missing anymore.
+func (s *Stream) applyFec(row bool, base uint32, count, xorLen int, xorData []byte) (recovered bool) {
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
 	if s.readCanceled || s.readErr != nil {
 		return false
 	}
-	if g := uint32(s.conn.cfg.fecGroup); base%(g*g) >= g {
+	g := uint32(s.conn.cfg.fecGroup)
+	if row {
+		if base%g != 0 {
+			return false // row bases are multiples of G: malformed
+		}
+	} else if base%(g*g) >= g {
 		return false // base doesn't sit on our lane geometry: malformed
 	}
-	switch s.tryReconstructLocked(base, count, xorLen, xorData) {
+	switch s.tryReconstructLocked(row, base, count, xorLen, xorData) {
 	case fecRecovered:
 		return true
 	case fecPendingMembers:
-		if s.fecPending == nil {
+		pending := s.fecPending
+		if row {
+			if s.fecPendingRow == nil {
+				s.fecPendingRow = make(map[uint32]fecPendingParity)
+			}
+			pending = s.fecPendingRow
+		} else if pending == nil {
 			s.fecPending = make(map[uint32]fecPendingParity)
+			pending = s.fecPending
 		}
-		if old, ok := s.fecPending[base]; ok {
+		if old, ok := pending[base]; ok {
 			s.reorderPutLocked(old.data)
-		} else if len(s.fecPending) >= 16 {
+		} else if len(pending) >= fecPendingCap {
 			// Bound the buffer: evict the oldest group.
 			oldest := ^uint32(0)
-			for k := range s.fecPending {
+			for k := range pending {
 				if k < oldest {
 					oldest = k
 				}
 			}
-			s.reorderPutLocked(s.fecPending[oldest].data)
-			delete(s.fecPending, oldest)
+			s.reorderPutLocked(pending[oldest].data)
+			delete(pending, oldest)
 		}
 		cp := s.reorderGetLocked(len(xorData))
 		copy(cp, xorData)
-		s.fecPending[base] = fecPendingParity{count: count, xorLen: xorLen, data: cp}
+		pending[base] = fecPendingParity{count: count, xorLen: xorLen, data: cp}
 	}
 	return false
 }
 
 // tryReconstructLocked attempts the group reconstruction described on
-// applyFec. Delivered members are read from the group's accumulator (all at
-// once — they're pre-XORed), buffered members from the reorder map. A
-// member that is neither folded, nor buffered, nor still in flight
-// (seq < readSeq) means the accumulator was swept — recovery is impossible
-// but, crucially, never wrong: a stale or recreated accumulator can only
-// make delivered members look missing, which lands in this bail-out or the
-// two-missing pending path, never in a garbage reconstruction. Caller
-// holds readMu.
-func (s *Stream) tryReconstructLocked(base uint32, count, xorLen int, xorData []byte) int {
+// applyFec, for a column group (row=false, members strided G apart) or a
+// row group (row=true, consecutive members). Delivered members are read
+// from the group's accumulator (all at once — they're pre-XORed), buffered
+// members from the reorder map. A member that is neither folded, nor
+// buffered, nor still in flight (seq < readSeq) means the accumulator was
+// swept — recovery is impossible but, crucially, never wrong: a stale or
+// recreated accumulator can only make delivered members look missing,
+// which lands in this bail-out or the two-missing pending path, never in a
+// garbage reconstruction. Caller holds readMu.
+func (s *Stream) tryReconstructLocked(row bool, base uint32, count, xorLen int, xorData []byte) int {
 	stride := uint32(s.conn.cfg.fecGroup)
+	accs := s.fecAcc
+	if row {
+		stride = 1
+		accs = s.fecAccRow
+	}
 	if s.readSeq > base+uint32(count-1)*stride {
 		return fecUseless // every member already delivered
 	}
-	acc := s.fecAcc[base]
+	acc := accs[base]
 	var folded uint32
 	if acc != nil {
 		if acc.maxLen > len(xorData) {
@@ -1038,11 +1138,16 @@ func (s *Stream) maybeGrowLocked() {
 	s.grantLocked(newCap - oldCap)
 }
 
-// maxNackSeqsPerFire bounds how many missing frames one NACK asks for.
-// Large enough to cover a burst hole (e.g. a whole lost GSO super-packet is
-// only ~7 frames), small enough that a mistaken NACK volley (frames that
-// were merely late, not lost) costs little duplicate traffic.
-const maxNackSeqsPerFire = 64
+// maxNackSeqsPerFire bounds how many missing frames one NACK asks for (the
+// wire format caps it further at one frame's seq capacity). A large window
+// on a lossy link can hold hundreds of concurrent gaps; a small volley
+// fast-retransmits only the head-most few and leaves the rest to the far
+// slower RTO timer, so the budget should comfortably exceed the plausible
+// concurrent-loss population. Over-asking is cheap since the sender
+// suppresses resends of anything re-sent within the last ¾·SRTT (see
+// retransmitQueue.getForResend) — a mistaken or repeated volley no longer
+// multiplies duplicate traffic.
+const maxNackSeqsPerFire = 1024
 
 // maybeFastRetransmitLocked asks the peer to immediately resend frames we
 // have reasonable evidence are actually lost rather than merely reordered:
@@ -1063,7 +1168,7 @@ const maxNackSeqsPerFire = 64
 func (s *Stream) maybeFastRetransmitLocked() {
 	now := time.Now()
 	s.lastArrivalAt = now // an out-of-order arrival is still an arrival
-	grace := s.conn.currentRTO() / reorderGraceFraction
+	grace := s.conn.reorderGrace()
 
 	if s.readSeq != s.gapSeq {
 		// First sign of a new gap at this readSeq: start the clock, but
@@ -1097,7 +1202,7 @@ func (s *Stream) maybeTailNack(now time.Time) {
 	if !gap || s.lastArrivalAt.IsZero() {
 		return
 	}
-	grace := s.conn.currentRTO() / reorderGraceFraction
+	grace := s.conn.reorderGrace()
 	if now.Sub(s.lastArrivalAt) < grace || now.Sub(s.lastNackAt) < grace {
 		return
 	}
@@ -1131,16 +1236,23 @@ func (s *Stream) fireNackLocked() {
 	}
 }
 
-// ackSnapshot returns the stream's receive state for an ACK frame: the
+// ackSnapshot returns the stream's receive state for ACK frames: the
 // cumulative contiguous watermark (every seq below it received or
-// discarded) and the seqs received beyond it — the buffered out-of-order
-// frames, plus the FIN's seq once seen. Because it describes state rather
-// than events, the resulting ACK is idempotent: re-advertised on every
-// flush, so any single lost ACK frame is healed by the next one. seqs
-// reuses scratch's backing array and is capped at maxSeqs.
-func (s *Stream) ackSnapshot(scratch []uint32, maxSeqs int) (cum uint32, seqs []uint32) {
+// discarded), the seqs received beyond it — the buffered out-of-order
+// frames, plus the FIN's seq once seen — and the current flow-control
+// watermark granted to the peer (re-advertised alongside the ACKs so a
+// lost WINDOW_UPDATE heals within a batch instead of stalling the sender
+// until the next grant). Because it describes state rather than events,
+// the resulting frames are idempotent: re-advertised on every flush, so
+// any single lost frame is healed by the next one. seqs reuses scratch's
+// backing array and is capped at maxSeqs; when the reorder buffer holds
+// more than maxSeqs frames, Go's randomized map iteration order makes
+// successive snapshots cover different subsets, so every buffered frame
+// still gets acknowledged within a few flushes.
+func (s *Stream) ackSnapshot(scratch []uint32, maxSeqs int) (cum uint32, seqs []uint32, granted int64) {
 	s.readMu.Lock()
 	cum = s.readSeq
+	granted = s.peerOffset
 	seqs = scratch[:0]
 	if s.finRecvd && s.finSeq >= cum && len(seqs) < maxSeqs {
 		seqs = append(seqs, s.finSeq)

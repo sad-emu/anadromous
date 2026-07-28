@@ -23,7 +23,8 @@ const (
 	frameStreamReset  uint8 = 0x0B // Abort the sender's write side (like QUIC RESET_STREAM)
 	frameStopSending  uint8 = 0x0C // Ask the peer to stop sending (like QUIC STOP_SENDING)
 	frameNack         uint8 = 0x0D // Fast retransmit: resend specific (stream, seq...) frames now; seq-list payload like ACK
-	frameFEC          uint8 = 0x0E // Forward-error-correction parity over a group of DATA frames
+	frameFEC          uint8 = 0x0E // Forward-error-correction parity over a strided ("column") group of DATA frames
+	frameFECRow       uint8 = 0x0F // FEC parity over G consecutive ("row") DATA frames — the second dimension, see WithFEC2D
 )
 
 // fecMetaLen is the per-frame metadata prefix present on DATA and FEC frame

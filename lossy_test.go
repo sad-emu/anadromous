@@ -86,10 +86,10 @@ func newLossyProxy(serverAddr string, profile lossyProfile) (*lossyProxy, error)
 	}
 	// Large socket buffers so the proxy itself isn't the drop source beyond
 	// the profile (bounded by net.core.{r,w}mem_max).
-	clientSide.SetReadBuffer(8 << 20)
-	clientSide.SetWriteBuffer(8 << 20)
-	serverSide.SetReadBuffer(8 << 20)
-	serverSide.SetWriteBuffer(8 << 20)
+	clientSide.SetReadBuffer(32 << 20)
+	clientSide.SetWriteBuffer(32 << 20)
+	serverSide.SetReadBuffer(32 << 20)
+	serverSide.SetWriteBuffer(32 << 20)
 
 	p := &lossyProxy{
 		profile:    profile,
