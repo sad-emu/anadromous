@@ -328,6 +328,32 @@ func (q *retransmitQueue) drainPendingFree() {
 	q.mu.Unlock()
 }
 
+// pendingFreeLen reports the current pendingFree watermark, for the
+// io_uring flush's deferred-recycling bookkeeping (buffers below a
+// watermark taken at flush k become recyclable at flush k+1 — see
+// Connection.flushSendUringLocked).
+func (q *retransmitQueue) pendingFreeLen() int {
+	q.mu.Lock()
+	n := len(q.pendingFree)
+	q.mu.Unlock()
+	return n
+}
+
+// drainPendingFreeFirst recycles only the first n pendingFree entries —
+// the ones a previously-recorded watermark proved are no longer referenced
+// by any in-flight send batch.
+func (q *retransmitQueue) drainPendingFreeFirst(n int) {
+	q.mu.Lock()
+	if n > len(q.pendingFree) {
+		n = len(q.pendingFree)
+	}
+	for _, buf := range q.pendingFree[:n] {
+		q.arena.put(buf)
+	}
+	q.pendingFree = append(q.pendingFree[:0], q.pendingFree[n:]...)
+	q.mu.Unlock()
+}
+
 // getForResend returns a copy of the pending entry for (streamID, seq) for
 // an immediate fast-retransmit resend, bumping its sentAt/retries exactly
 // like due() would, so the periodic scanner doesn't immediately re-select it

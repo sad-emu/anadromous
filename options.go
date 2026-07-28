@@ -33,6 +33,7 @@ type config struct {
 	retransmitTmout time.Duration
 	bindDevice      string // SO_BINDTODEVICE interface name, empty = unbound
 	enableGSO       bool
+	enableIOUring   bool
 	maxInFlight     int // per-stream cap on sent-but-unACKed bytes
 	fecGroup        int // DATA frames per FEC parity frame; 0 disables FEC
 	socketOpts      func(*unet.Socket)
@@ -50,6 +51,7 @@ func defaultConfig() config {
 		keepAlive:       defaultKeepAlive,
 		retransmitTmout: defaultRetransmitTimeout,
 		enableGSO:       true,
+		enableIOUring:   true,
 		fecGroup:        defaultFECGroup,
 	}
 }
@@ -208,6 +210,19 @@ func WithMaxBytesInFlight(n int) Option {
 // unpacked senders.
 func WithGSO(enabled bool) Option {
 	return func(c *config) { c.enableGSO = enabled }
+}
+
+// WithIOUring controls the pipelined io_uring send path: each flushed batch
+// is submitted as async SENDMSG operations that the kernel's io-wq workers
+// process while the application builds the next batch, instead of the
+// caller blocking in sendmmsg until every datagram has been handed to the
+// network stack. On by default; silently falls back to sendmmsg on kernels
+// without io_uring (or without IORING_FEAT_SINGLE_MMAP, pre-5.4), and in
+// environments that deny the io_uring syscalls entirely (some container
+// seccomp profiles). Wire format and receive path are unaffected — this is
+// purely a send-side execution strategy.
+func WithIOUring(enabled bool) Option {
+	return func(c *config) { c.enableIOUring = enabled }
 }
 
 // WithFEC sets how many DATA frames are covered by each XOR parity frame

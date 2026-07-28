@@ -32,17 +32,29 @@ type Connection struct {
 
 	// batched I/O endpoints
 	recvEP unet.UdpEndpoint
-	sendEP unet.UdpEndpoint
 
 	// receive scratch buffers — one per recvmmsg slot
 	recvBufs [][]byte
 
-	// send queue: frames are queued and flushed in batches via sendmmsg
-	sendMu   sync.Mutex
-	sendBufs [][]byte // pre-allocated datagram buffers
-	sendLens []int    // actual length written into each sendBuf
-	sendN    int      // number of pending messages in current batch
-	iovsPer  int      // iovecs per message slot (2*gsoMaxFrames, or 2 without GSO)
+	// send queue: frames are queued and flushed in batches, either
+	// synchronously via sendmmsg or pipelined via io_uring (see uring.go).
+	// The io_uring path double-buffers: two complete slot sets (buffers,
+	// iovecs, msghdrs) alternate, so batch N can be in flight in the kernel
+	// while batch N+1 is being built in the other set. Without io_uring only
+	// set 0 exists and never flips.
+	sendMu      sync.Mutex
+	sendEPs     [2]unet.UdpEndpoint
+	sendBufSets [2][][]byte
+	sendEP      *unet.UdpEndpoint // active set's endpoint (== &sendEPs[uringSet])
+	sendBufs    [][]byte          // active set's datagram buffers
+	sendLens    []int             // actual length written into each sendBuf
+	sendN       int               // number of pending messages in current batch
+	iovsPer     int               // iovecs per message slot (2*gsoMaxFrames, or 2 without GSO)
+
+	// io_uring send state (sendMu). uring == nil means the sendmmsg path.
+	uring     *sendRing
+	uringSet  int // active slot set, doubling as the CQE generation tag
+	uringMark int // retransmit pendingFree watermark taken at the last flush
 
 	// UDP GSO (UDP_SEGMENT) packing state, guarded by sendMu. When the
 	// socket option is supported, up to gsoMaxFrames full-size DATA frames
@@ -247,7 +259,7 @@ func newConnection(sock *unet.Socket, fd int, remote unet.Address, connID uint64
 		recvIdx++
 	}, nil) // connected socket, no name needed
 
-	// Set up batched send endpoint. Each message slot has iovsPer iovecs
+	// Set up batched send endpoint(s). Each message slot has iovsPer iovecs
 	// used in (header, payload) pairs: iov[0] is the slot's own buffer,
 	// holding either a fully-encoded frame (header and payload combined,
 	// for the low-traffic control frame types) or one or more 13-byte
@@ -255,20 +267,35 @@ func newConnection(sock *unet.Socket, fd int, remote unet.Address, connID uint64
 	// arena); each odd iovec points directly at an arena payload so bulk
 	// data is never copied into a send buffer at all (see
 	// commitSendSlotZeroCopy and queueFrameGSOLocked).
-	c.sendBufs = make([][]byte, cfg.batchSize)
 	c.sendLens = make([]int, cfg.batchSize)
-	sendIdx := 0
-	c.sendEP.SetupVectors(cfg.batchSize, c.iovsPer, func(iov []syscall.Iovec) {
-		b := make([]byte, maxDatagram)
-		c.sendBufs[sendIdx] = b
-		iov[0].Base = &b[0]
-		iov[0].Len = 0 // set to actual frame size on each send
-		for i := 1; i < len(iov); i++ {
-			iov[i].Base = nil
-			iov[i].Len = 0
+	setupSendEP := func(set int) {
+		bufs := make([][]byte, cfg.batchSize)
+		c.sendBufSets[set] = bufs
+		idx := 0
+		c.sendEPs[set].SetupVectors(cfg.batchSize, c.iovsPer, func(iov []syscall.Iovec) {
+			b := make([]byte, maxDatagram)
+			bufs[idx] = b
+			iov[0].Base = &b[0]
+			iov[0].Len = 0 // set to actual frame size on each send
+			for i := 1; i < len(iov); i++ {
+				iov[i].Base = nil
+				iov[i].Len = 0
+			}
+			idx++
+		}, nil) // connected socket, no name needed
+	}
+	setupSendEP(0)
+	c.sendEP = &c.sendEPs[0]
+	c.sendBufs = c.sendBufSets[0]
+
+	// Try to set up the pipelined io_uring send path; the ring must hold two
+	// full batches (both slot sets in flight at the worst moment). Falls back
+	// to sendmmsg when unavailable.
+	if cfg.enableIOUring {
+		if c.uring = newSendRing(2 * cfg.batchSize); c.uring != nil {
+			setupSendEP(1)
 		}
-		sendIdx++
-	}, nil) // connected socket, no name needed
+	}
 
 	return c
 }
@@ -385,6 +412,15 @@ func (c *Connection) Close() error {
 
 	// Wait for the read loop to exit.
 	c.doneWg.Wait()
+
+	// Drain and release the io_uring before the socket fd goes away — its
+	// in-flight sends reference the fd and the slot buffers.
+	c.sendMu.Lock()
+	if c.uring != nil {
+		c.uring.close()
+		c.uring = nil
+	}
+	c.sendMu.Unlock()
 
 	// Close the socket fd.
 	c.sock.Close()
@@ -711,8 +747,11 @@ func (c *Connection) flushSendLocked() error {
 	}
 
 	n := c.sendN
-	_, errno := unet.SendMMsgRetry(uintptr(c.fd), c.sendEP.Hdrs[:n], n)
 	c.sendN = 0
+	if c.uring != nil {
+		return c.flushSendUringLocked(n)
+	}
+	_, errno := unet.SendMMsgRetry(uintptr(c.fd), c.sendEP.Hdrs[:n], n)
 	// No per-iovec reset is needed: every path that claims a slot stamps
 	// its Iovlen, lengths, and iovec pointers before the next flush.
 
@@ -722,6 +761,42 @@ func (c *Connection) flushSendLocked() error {
 	c.retransmit.drainPendingFree()
 
 	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// flushSendUringLocked submits the active slot set's n messages as async
+// SENDMSG operations and returns without waiting for them: the kernel
+// processes batch N on its io-wq workers while the caller builds batch N+1
+// in the other slot set. The flip's safety rules:
+//
+//   - The set being flipped INTO may still have its previous submission in
+//     flight, so wait that generation out before returning (normally a free
+//     reap — it has had a whole batch's build time to finish).
+//   - Arena buffers freed by ACKs can only be recycled once every batch
+//     possibly referencing them has completed. A buffer freed before flush
+//     k's queuing began is referenced only by batches < k, all complete by
+//     the wait above — so each flush releases the entries recorded at the
+//     previous flush's watermark, one flush behind their free time.
+//
+// Frames may complete (and so hit the wire) out of order across a batch;
+// like network reordering, the receiver's reorder buffer absorbs it and the
+// idempotent ACK/window frames are unaffected. Caller holds sendMu.
+func (c *Connection) flushSendUringLocked(n int) error {
+	set := c.uringSet
+	if errno := c.uring.submitSendmsg(c.fd, c.sendEP.Hdrs[:n], set); errno != 0 {
+		return errno
+	}
+	c.uringSet ^= 1
+	c.sendEP = &c.sendEPs[c.uringSet]
+	c.sendBufs = c.sendBufSets[c.uringSet]
+	if errno := c.uring.waitGen(c.uringSet); errno != 0 {
+		return errno
+	}
+	c.retransmit.drainPendingFreeFirst(c.uringMark)
+	c.uringMark = c.retransmit.pendingFreeLen()
+	if errno := c.uring.collectErr(); errno != 0 {
 		return errno
 	}
 	return nil
