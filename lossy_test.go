@@ -215,3 +215,11 @@ func (p *lossyProxy) startDeliverer(send func([]byte), seed int64) chan<- []byte
 	}()
 	return in
 }
+
+// harshProfile is netemLikeProfile at double the loss rate, for probing
+// recovery schemes where multi-loss groups dominate.
+func harshProfile() lossyProfile {
+	p := netemLikeProfile()
+	p.dropProb = 0.20
+	return p
+}

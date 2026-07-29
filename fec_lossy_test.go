@@ -129,6 +129,7 @@ func TestLossyDataIntegrity(t *testing.T) {
 
 	t.Run("FEC", func(t *testing.T) { run(t, true) })
 	t.Run("FEC2D", func(t *testing.T) { run(t, true, WithFEC2D(true)) })
+	t.Run("Paced", func(t *testing.T) { run(t, true, WithPacingRate(64<<20)) })
 	t.Run("NoFEC", func(t *testing.T) { run(t, false, WithFEC(0)) })
 	// The sendmmsg fallback path (kernels/seccomp without io_uring) must
 	// deliver the same bytes too.

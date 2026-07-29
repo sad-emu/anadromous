@@ -5,6 +5,7 @@ package anadromous
 import (
 	"io"
 	"testing"
+	"time"
 )
 
 // benchPair builds a connected client/server pair on loopback with settings
@@ -161,5 +162,56 @@ func BenchmarkThroughputLossyBigWindow2D(b *testing.B) {
 // the second FEC dimension for multi-loss recovery.
 func BenchmarkThroughputLossy2D(b *testing.B) {
 	cs, ss := lossyBenchPair(b, WithFEC2D(true))
+	benchThroughput(b, cs, ss)
+}
+
+// harshBenchPair is lossyBenchPair at double the loss (harshProfile): the
+// regime where multi-loss parity groups dominate and recovery schemes
+// separate.
+func harshBenchPair(b *testing.B, extra ...Option) (*Stream, *Stream) {
+	var proxy *lossyProxy
+	return benchPairVia(b, func(serverAddr string) string {
+		var err error
+		proxy, err = newLossyProxy(serverAddr, harshProfile())
+		if err != nil {
+			b.Fatalf("newLossyProxy: %v", err)
+		}
+		b.Cleanup(proxy.Close)
+		return proxy.Addr()
+	}, extra...)
+}
+
+func BenchmarkThroughputHarsh2D(b *testing.B) {
+	cs, ss := harshBenchPair(b, WithFEC2D(true))
+	benchThroughput(b, cs, ss)
+}
+
+func proxyBenchPair(b *testing.B, p lossyProfile, extra ...Option) (*Stream, *Stream) {
+	var proxy *lossyProxy
+	return benchPairVia(b, func(serverAddr string) string {
+		var err error
+		proxy, err = newLossyProxy(serverAddr, p)
+		if err != nil {
+			b.Fatalf("newLossyProxy: %v", err)
+		}
+		b.Cleanup(proxy.Close)
+		return proxy.Addr()
+	}, extra...)
+}
+
+// Probe: proxy ceiling with NO impairment beyond delay (window/BDP bound).
+func BenchmarkProxyCeiling50ms(b *testing.B) {
+	cs, ss := proxyBenchPair(b, lossyProfile{delay: 50 * time.Millisecond, seed: 1})
+	benchThroughput(b, cs, ss)
+}
+
+func BenchmarkProxyPaced1G(b *testing.B) {
+	cs, ss := proxyBenchPair(b, lossyProfile{delay: 50 * time.Millisecond, seed: 1},
+		WithPacingRate(1000<<20))
+	benchThroughput(b, cs, ss)
+}
+
+func BenchmarkLossyPaced(b *testing.B) {
+	cs, ss := lossyBenchPair(b, WithPacingRate(1000<<20))
 	benchThroughput(b, cs, ss)
 }

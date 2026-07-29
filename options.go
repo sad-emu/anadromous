@@ -46,6 +46,7 @@ type config struct {
 	maxInFlight     int  // per-stream cap on sent-but-unACKed bytes
 	fecGroup        int  // DATA frames per FEC parity frame; 0 disables FEC
 	fec2D           bool // add row parity (second FEC dimension) — see WithFEC2D
+	paceRate        int  // sender pacing rate, bytes/sec; 0 = unpaced — see WithPacingRate
 	socketOpts      func(*unet.Socket)
 }
 
@@ -287,6 +288,38 @@ func WithFEC(groupSize int) Option {
 // row state that a non-sending peer never uses. Requires WithFEC > 0.
 func WithFEC2D(enabled bool) Option {
 	return func(c *config) { c.fec2D = enabled }
+}
+
+// WithPacingRate sets the connection's send rate in bytes per second —
+// size it to the link's provisioned capacity. This protocol never backs
+// off: the pacer holds the wire at exactly this rate through any amount of
+// loss, which is what actually keeps a known-capacity pipe 100% utilized.
+// An UNPACED sender transmits in line-rate bursts (as fast as the CPU and
+// NIC go), and whenever the path's bottleneck is slower than that, its
+// queue overflows and drops — self-inflicted loss that no recovery scheme
+// can outrun. Pacing removes the self-inflicted component entirely;
+// random path loss is then absorbed by FEC/NACK recovery without the rate
+// ever dipping.
+//
+// Retransmissions and FEC parity spend from the same budget (retransmits
+// with priority — they never wait), so the wire rate stays at the
+// configured value rather than ballooning past it under loss; new data
+// slows by exactly the overhead being spent on recovery, no more.
+//
+// Setting a rate also unlocks the uncapped long-RTT send window (bounded
+// only by flow control / WithStreamBufferSize instead of the socket
+// buffer), which is what lets throughput reach rate×RTT products far past
+// the socket buffer. Zero (the default) disables pacing AND keeps the
+// bounded window: unpaced line-rate bursts into a slower bottleneck cause
+// self-inflicted drop storms, and with an uncapped window those play out
+// as multi-second Write stalls.
+func WithPacingRate(bytesPerSec int) Option {
+	return func(c *config) {
+		if bytesPerSec < 0 {
+			bytesPerSec = 0
+		}
+		c.paceRate = bytesPerSec
+	}
 }
 
 // WithSocketOptions provides an escape hatch for setting arbitrary unet socket options.

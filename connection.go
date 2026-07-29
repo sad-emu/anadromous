@@ -107,6 +107,16 @@ type Connection struct {
 	inFlightCapLan int64
 	inFlightCapWan int64
 
+	// Pacing state (WithPacingRate): a token bucket in bytes, shared by
+	// every stream on the connection. paceTokens may go negative —
+	// retransmissions and parity charge without waiting (loss recovery is
+	// never delayed), and the deficit is repaid by new data waiting longer,
+	// which is what holds the TOTAL wire rate at the configured value.
+	paceMu     sync.Mutex
+	paceTokens int64
+	paceLast   time.Time
+	paceBurst  int64
+
 	// onClose, if set, is invoked once when the connection closes (used by
 	// Listener to remove the connection from its tracking map).
 	onClose func()
@@ -172,32 +182,59 @@ func newConnection(sock *unet.Socket, fd int, remote unet.Address, connID uint64
 	c.rttMs.Store(-1)
 	c.rtoNs.Store(int64(cfg.retransmitTmout))
 
-	// Resolve the in-flight caps. Without an explicit WithMaxBytesInFlight,
-	// prefer the kernel's actually-granted receive buffer (getsockopt returns
-	// the doubled — and, crucially, rmem_max-clamped — real capacity) over
-	// the configured request as the estimate of what a peer provisioned like
-	// us can absorb. Two caps are derived; inFlightCap picks by measured
-	// RTT:
+	if cfg.paceRate > 0 {
+		// Burst budget ≈ 2ms of line rate: big enough that the sub-ms sleep
+		// granularity and per-batch sends never starve the wire below the
+		// configured rate, small enough that a bottleneck queue sees an
+		// almost perfectly smooth flow rather than line-rate bursts.
+		c.paceBurst = int64(cfg.paceRate) / 500
+		if min := int64(2 * cfg.maxDatagram()); c.paceBurst < min {
+			c.paceBurst = min
+		}
+		c.paceTokens = c.paceBurst
+	}
+
+	// Resolve the in-flight caps; inFlightCap picks between them by
+	// measured RTT, because RTT decides where the window physically lives:
 	//
-	//   - LAN (short RTT): granted/2 — the un-doubled request. The kernel
-	//     doubles SO_RCVBUF requests precisely because it charges arriving
-	//     data at skb truesize (payload plus bookkeeping overhead), so the
-	//     buffer's usable PAYLOAD capacity is roughly the request; on a
-	//     near-zero-RTT path the entire window can end up resident in the
-	//     receive buffer, so the cap must fit inside that.
-	//   - WAN (real RTT): granted − granted/4. Most of the window is stored
-	//     on the wire, not in the buffer, so the cap can approach the full
-	//     granted size — while the 25% margin covers retransmitted
-	//     duplicates, which ride ON TOP of the cap (bytesInFlight counts
-	//     unique unACKed bytes, not wire bytes) and would otherwise let a
-	//     single drop overflow the buffer and sustain the drop→retransmit
-	//     collapse documented on WithMaxBytesInFlight.
+	//   - LAN (short RTT): the wire stores almost nothing, so everything
+	//     outstanding piles into the receiver's SOCKET buffer, and the cap
+	//     must fit its usable payload capacity: granted/2, the un-doubled
+	//     request (the kernel doubles SO_RCVBUF requests precisely because
+	//     it charges arriving data at skb truesize — payload plus
+	//     bookkeeping overhead). Without this cap the sender's only brake
+	//     is flow control, whose window is far larger than the socket
+	//     buffer, and a faster-than-receiver sender collapses into the
+	//     drop→retransmit spiral documented on WithMaxBytesInFlight.
+	//   - WAN (real RTT), PACED: no socket-derived cap at all. The window
+	//     is stored on the wire, and the receiver's real capacity is its
+	//     flow-controlled stream ring (WithStreamBufferSize), which already
+	//     bounds bytesInFlight via Stream.inFlightCap's stream-buffer
+	//     clamp. This protocol never backs off by design — links are
+	//     provisioned, and the goal is to keep the pipe full through loss —
+	//     so tying the WAN window to the (comparatively tiny) socket buffer
+	//     just capped throughput at socketBuffer/RTT for no protective
+	//     benefit: on a real path the socket buffer only has to absorb
+	//     readLoop scheduling gaps, not the whole window.
+	//   - WAN, UNPACED: granted − granted/4, the bounded window. The
+	//     uncapped window is only safe when the pacer keeps the sender's
+	//     bursts at the pipe's known rate; an unpaced sender bursts at line
+	//     rate, and if that overruns the bottleneck, the self-inflicted
+	//     drop storm plays out across the whole (huge) window — Write then
+	//     stalls for seconds mid-recovery, which applications above (e.g. a
+	//     TCP bridge) experience as their own I/O timeouts. The bounded
+	//     window keeps stall depth at ~1 RTT instead.
+	//
+	// An explicit WithMaxBytesInFlight replaces both.
 	c.inFlightCapLan = int64(cfg.effectiveMaxInFlight())
 	c.inFlightCapWan = c.inFlightCapLan
 	if cfg.maxInFlight == 0 {
 		if granted, err := syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF); err == nil && granted > 0 {
 			c.inFlightCapLan = int64(granted / 2)
 			c.inFlightCapWan = int64(granted - granted/4)
+		}
+		if cfg.paceRate > 0 {
+			c.inFlightCapWan = int64(1) << 62 // stream-buffer clamp governs
 		}
 	}
 
@@ -479,6 +516,42 @@ func (c *Connection) writeFrameHdr(buf []byte, ftype uint8, streamID, seq uint32
 	return hdrLen
 }
 
+// paceCharge deducts n wire bytes from the pacing bucket. With block=true
+// (the Write path) it sleeps until the balance is non-negative — callers
+// must NOT hold locks that the receive path needs (readMu/writeMu/recvMu),
+// since sleeps here are the pacing itself. With block=false
+// (retransmissions, parity) the charge is immediate and the balance may go
+// negative; new data repays the deficit. No-op when pacing is off.
+func (c *Connection) paceCharge(n int, block bool) {
+	rate := int64(c.cfg.paceRate)
+	if rate <= 0 {
+		return
+	}
+	c.paceMu.Lock()
+	for {
+		now := time.Now()
+		if !c.paceLast.IsZero() {
+			if elapsed := now.Sub(c.paceLast); elapsed > 0 {
+				c.paceTokens += int64(elapsed) * rate / int64(time.Second)
+				if c.paceTokens > c.paceBurst {
+					c.paceTokens = c.paceBurst
+				}
+			}
+		}
+		c.paceLast = now
+		c.paceTokens -= int64(n)
+		n = 0
+		if !block || c.paceTokens >= 0 || c.closed.Load() {
+			c.paceMu.Unlock()
+			return
+		}
+		wait := time.Duration(-c.paceTokens * int64(time.Second) / rate)
+		c.paceMu.Unlock()
+		time.Sleep(wait)
+		c.paceMu.Lock()
+	}
+}
+
 // sendDataFrame queues a DATA frame and records it for retransmission until
 // acknowledged. payload is copied once into the retransmit arena (see
 // retransmitQueue.add) and referenced directly on the wire from there — see
@@ -514,6 +587,7 @@ func (c *Connection) sendFecFrame(ftype uint8, streamID, base uint32, count, xor
 	if err != nil {
 		return err
 	}
+	c.paceCharge(frameHeaderSize+fecMetaLen+len(xorData), false)
 	meta := uint32(count)<<16 | uint32(xorLen)
 	encodeHeader(buf, ftype, streamID, base, uint32(fecMetaLen+len(xorData)))
 	binary.BigEndian.PutUint32(buf[frameHeaderSize:], meta)
@@ -632,6 +706,9 @@ func (c *Connection) queueResendFrame(e retransmitEntry) error {
 }
 
 func (c *Connection) queueResendCopy(e retransmitEntry) error {
+	// Retransmissions charge the pacing budget without waiting: recovery is
+	// never delayed, and the deficit slows new data instead.
+	c.paceCharge(len(e.data)+frameHeaderSize, false)
 	if c.gsoMaxFrames >= 2 {
 		c.sendMu.Lock()
 		err := c.queueFrameGSOLocked(e.ftype, e.streamID, e.seq, e.data)

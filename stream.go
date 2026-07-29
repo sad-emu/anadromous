@@ -251,6 +251,15 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 		if chunkLen > maxChunk {
 			chunkLen = maxChunk
 		}
+		// Pacing (WithPacingRate): charge this chunk's wire bytes before the
+		// window checks, with writeMu released — the pacer's sleeps must not
+		// stall ACK credit (creditAcked) or window updates, both of which
+		// need writeMu from the receive path.
+		if s.conn.cfg.paceRate > 0 {
+			s.writeMu.Unlock()
+			s.conn.paceCharge(chunkLen+frameHeaderSize, true)
+			s.writeMu.Lock()
+		}
 		// Never overshoot the flow-control window (the receiver's ring is
 		// sized exactly to the credit it has granted, so an oversized frame
 		// would be dropped and limp in via retransmission), and never exceed
