@@ -3,7 +3,9 @@
 package anadromous
 
 import (
+	"context"
 	"io"
+	"sync"
 	"testing"
 	"time"
 )
@@ -78,6 +80,169 @@ func BenchmarkThroughput(b *testing.B) {
 func BenchmarkThroughputGSO(b *testing.B) {
 	cs, ss := benchPair(b, WithGSO(true))
 	benchThroughput(b, cs, ss)
+}
+
+// BenchmarkThroughputPaced10G is the provisioned-line acceptance benchmark.
+// The custom metric is carrier-counted output; ordinary B/s remains delivered
+// application goodput and is lower when FEC consumes part of the 10 Gbit/s
+// wire budget.
+func BenchmarkThroughputPaced10G(b *testing.B) {
+	cs, ss := benchPair(b,
+		WithPacingRate(1_250_000_000),
+		WithPacingAccounting(WireAccounting{
+			PerDatagramOverhead: 66,
+			MinimumDatagramSize: 84,
+		}),
+	)
+	pacer := cs.conn.wirePacer
+	before := pacer.Stats()
+	benchThroughput(b, cs, ss)
+	after := pacer.Stats()
+	if elapsed := b.Elapsed(); elapsed > 0 {
+		b.ReportMetric(float64(after.WireBytes-before.WireBytes)/elapsed.Seconds(), "wire-B/s")
+	}
+}
+
+// BenchmarkThroughputPaced10GNoFEC isolates pacing/batching overhead from the
+// default parity budget; delivered goodput should approach the wire metric.
+func BenchmarkThroughputPaced10GNoFEC(b *testing.B) {
+	cs, ss := benchPair(b,
+		WithFEC(0),
+		WithPacingRate(1_250_000_000),
+		WithPacingAccounting(WireAccounting{
+			PerDatagramOverhead: 66,
+			MinimumDatagramSize: 84,
+		}),
+	)
+	pacer := cs.conn.wirePacer
+	before := pacer.Stats()
+	benchThroughput(b, cs, ss)
+	after := pacer.Stats()
+	if elapsed := b.Elapsed(); elapsed > 0 {
+		b.ReportMetric(float64(after.WireBytes-before.WireBytes)/elapsed.Seconds(), "wire-B/s")
+	}
+}
+
+// BenchmarkThroughputPaced10GTwoConnections verifies the aggregate bridge
+// case: two independently-stalling connections share one 10 Gbit/s sender
+// budget, so either can consume tokens while the other is waiting on protocol
+// work without multiplying the provisioned wire rate.
+func BenchmarkThroughputPaced10GTwoConnections(b *testing.B) {
+	const (
+		connections = 2
+		chunk       = 64 * 1024
+	)
+	serverPacer := NewWirePacer(WirePacerConfig{
+		RateBytesPerSecond: 1_250_000_000,
+		Accounting: WireAccounting{
+			PerDatagramOverhead: 66,
+			MinimumDatagramSize: 84,
+		},
+	})
+	base := []Option{
+		WithMaxDatagramSize(8500),
+		WithStreamBufferSize(256 * 1024 * 1024),
+	}
+	listenOpts := append(append([]Option{}, base...), WithWirePacer(serverPacer))
+	ln, err := Listen("127.0.0.1:0", listenOpts...)
+	if err != nil {
+		b.Fatalf("Listen: %v", err)
+	}
+	b.Cleanup(func() { ln.Close() })
+
+	clientPacer := NewWirePacer(WirePacerConfig{
+		RateBytesPerSecond: 1_250_000_000,
+		Accounting: WireAccounting{
+			PerDatagramOverhead: 66,
+			MinimumDatagramSize: 84,
+		},
+	})
+	dialOpts := append(append([]Option{}, base...), WithWirePacer(clientPacer))
+	writers := make([]*Stream, 0, connections)
+	readers := make([]*Stream, 0, connections)
+	for i := 0; i < connections; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		client, dialErr := Dial(ctx, ln.Addr().String(), dialOpts...)
+		cancel()
+		if dialErr != nil {
+			b.Fatalf("Dial %d: %v", i, dialErr)
+		}
+		b.Cleanup(func() { client.Close() })
+		server, acceptErr := ln.Accept(context.Background())
+		if acceptErr != nil {
+			b.Fatalf("Accept %d: %v", i, acceptErr)
+		}
+		writer, openErr := client.OpenStream(context.Background())
+		if openErr != nil {
+			b.Fatalf("OpenStream %d: %v", i, openErr)
+		}
+		if _, writeErr := writer.Write([]byte{0}); writeErr != nil {
+			b.Fatalf("initial Write %d: %v", i, writeErr)
+		}
+		reader, streamErr := server.AcceptStream(context.Background())
+		if streamErr != nil {
+			b.Fatalf("AcceptStream %d: %v", i, streamErr)
+		}
+		var one [1]byte
+		if _, readErr := io.ReadFull(reader, one[:]); readErr != nil {
+			b.Fatalf("initial Read %d: %v", i, readErr)
+		}
+		writers = append(writers, writer)
+		readers = append(readers, reader)
+	}
+
+	readDone := make(chan error, connections)
+	for _, reader := range readers {
+		go func(s *Stream) {
+			_, copyErr := io.CopyBuffer(io.Discard, s, make([]byte, chunk))
+			readDone <- copyErr
+		}(reader)
+	}
+	bufs := make([][]byte, connections)
+	for i := range bufs {
+		bufs[i] = make([]byte, chunk)
+	}
+
+	before := clientPacer.Stats()
+	b.SetBytes(connections * chunk)
+	b.ResetTimer()
+	var writes sync.WaitGroup
+	writes.Add(connections)
+	for i, writer := range writers {
+		go func(s *Stream, buf []byte) {
+			defer writes.Done()
+			for j := 0; j < b.N; j++ {
+				if _, writeErr := s.Write(buf); writeErr != nil {
+					b.Errorf("Write: %v", writeErr)
+					return
+				}
+			}
+		}(writer, bufs[i])
+	}
+	writes.Wait()
+	b.StopTimer()
+	after := clientPacer.Stats()
+
+	for _, writer := range writers {
+		writer.Close()
+	}
+	for range readers {
+		if readErr := <-readDone; readErr != nil {
+			b.Fatalf("read side: %v", readErr)
+		}
+	}
+	var resends, reorder, recovered int64
+	for _, writer := range writers {
+		resends += writer.conn.statResends.Load()
+	}
+	for _, reader := range readers {
+		reorder += reader.conn.statReorder.Load()
+		recovered += reader.conn.statFecRecovered.Load()
+	}
+	b.Logf("aggregate sender resends=%d; receiver reorder=%d fec-recovered=%d", resends, reorder, recovered)
+	if elapsed := b.Elapsed(); elapsed > 0 {
+		b.ReportMetric(float64(after.WireBytes-before.WireBytes)/elapsed.Seconds(), "wire-B/s")
+	}
 }
 
 // BenchmarkThroughputLossy pushes bulk data through the in-process hostile

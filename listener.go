@@ -54,6 +54,7 @@ func Listen(addr string, opts ...Option) (*Listener, error) {
 		SetOptReuseAddr().
 		SetOpt(setRcvBuf(cfg.recvBufSize)).
 		SetOpt(setSndBuf(cfg.sendBufSize)).
+		SetOpt(setKernelPacingRate(cfg.wirePacer), cfg.wirePacer == nil).
 		SetOpt(bindToDevice(cfg.bindDevice), cfg.bindDevice == "")
 
 	if cfg.socketOpts != nil {
@@ -96,6 +97,9 @@ func (l *Listener) Accept(ctx context.Context) (*Connection, error) {
 	case <-l.closeCh:
 		return nil, ErrClosed
 	case c := <-l.acceptCh:
+		if l.closed.Load() {
+			return nil, ErrClosed
+		}
 		return c, nil
 	}
 }
@@ -167,8 +171,7 @@ func (l *Listener) readLoop() {
 			// Forward to existing connection's read path. This is a rare
 			// fallback (SO_REUSEPORT normally routes exact-match connected
 			// sockets directly), so flushing acks per-datagram here is fine.
-			existing.handleDatagram(buf[:n])
-			existing.flushPendingAcks()
+			existing.handleDatagramAndFlush(buf[:n])
 			continue
 		}
 
@@ -189,12 +192,23 @@ func (l *Listener) readLoop() {
 			continue
 		}
 
-		// Send handshake ACK back via the new connected socket.
-		conn.sendControlFrame(frameHandshake, 0, 0)
-
+		// Publish ownership before any connection goroutine or handshake ACK
+		// can provoke Close/onClose. Otherwise a queued GOAWAY can finish
+		// teardown while the connection is absent, after which inserting it
+		// here would retain and offer an already-closed connection forever.
 		l.connMu.Lock()
 		l.conns[key] = conn
 		l.connMu.Unlock()
+		conn.start()
+
+		// Send handshake ACK back via the new connected socket.
+		if err := conn.sendControlFrame(frameHandshake, 0, 0); err != nil {
+			conn.Close()
+			continue
+		}
+		if conn.closed.Load() {
+			continue
+		}
 
 		select {
 		case l.acceptCh <- conn:
@@ -211,18 +225,24 @@ func (l *Listener) createConnection(
 	remoteAddr unet.Address,
 	connID uint64,
 ) (*Connection, error) {
+	// Preserve WithPacingRate's historical per-connection behavior. An
+	// explicitly supplied WirePacer pointer remains shared across all copies;
+	// a legacy rate is materialized separately for each accepted connection.
+	cfg := l.cfg
+	cfg.ensureWirePacer()
 	sock := unet.NewSocket().
 		SetNearAddr(l.sock.NearAddr).
 		SetFarAddr(remote).
 		ConstructUdp().
 		SetOptReusePort().
 		SetOptReuseAddr().
-		SetOpt(setRcvBuf(l.cfg.recvBufSize)).
-		SetOpt(setSndBuf(l.cfg.sendBufSize)).
-		SetOpt(bindToDevice(l.cfg.bindDevice), l.cfg.bindDevice == "")
+		SetOpt(setRcvBuf(cfg.recvBufSize)).
+		SetOpt(setSndBuf(cfg.sendBufSize)).
+		SetOpt(setKernelPacingRate(cfg.wirePacer), cfg.wirePacer == nil).
+		SetOpt(bindToDevice(cfg.bindDevice), cfg.bindDevice == "")
 
-	if l.cfg.socketOpts != nil {
-		l.cfg.socketOpts(sock)
+	if cfg.socketOpts != nil {
+		cfg.socketOpts(sock)
 	}
 
 	sock = sock.Bind().Connect()
@@ -237,9 +257,8 @@ func (l *Listener) createConnection(
 		return nil, ErrClosed
 	}
 
-	c := newConnection(sock, fd, remoteAddr, connID, false, l.cfg)
+	c := newConnection(sock, fd, remoteAddr, connID, false, cfg)
 	c.onClose = func() { l.removeConnection(remoteAddr.String()) }
-	c.start()
 	return c, nil
 }
 

@@ -74,6 +74,9 @@ type Stream struct {
 	readSeq        uint32            // next expected sequence number
 	reorder        map[uint32][]byte // out-of-order frames awaiting earlier seqs
 	reorderBytes   int
+	reorderAckSeqs []uint32                    // insertion-order ACK index; avoids map iteration in ackSnapshot
+	reorderAckPos  int                         // rotating snapshot cursor into reorderAckSeqs
+	reorderAckDead int                         // drained entries retained in reorderAckSeqs until compaction
 	finRecvd       bool                        // peer sent FIN
 	finSeq         uint32                      // seq position of the peer's FIN (== count of data frames)
 	readErr        error                       // sticky read result: io.EOF, ErrStreamReset, ErrStreamClosed
@@ -250,15 +253,6 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 		chunkLen := len(p)
 		if chunkLen > maxChunk {
 			chunkLen = maxChunk
-		}
-		// Pacing (WithPacingRate): charge this chunk's wire bytes before the
-		// window checks, with writeMu released — the pacer's sleeps must not
-		// stall ACK credit (creditAcked) or window updates, both of which
-		// need writeMu from the receive path.
-		if s.conn.cfg.paceRate > 0 {
-			s.writeMu.Unlock()
-			s.conn.paceCharge(chunkLen+frameHeaderSize, true)
-			s.writeMu.Lock()
 		}
 		// Never overshoot the flow-control window (the receiver's ring is
 		// sized exactly to the credit it has granted, so an oversized frame
@@ -505,6 +499,9 @@ func (s *Stream) discardReadStateLocked() {
 	s.readHead, s.readTail, s.readLen = 0, 0, 0
 	s.reorder = make(map[uint32][]byte)
 	s.reorderBytes = 0
+	s.reorderAckSeqs = s.reorderAckSeqs[:0]
+	s.reorderAckPos = 0
+	s.reorderAckDead = 0
 	s.fecAcc = nil
 	s.fecPending = nil
 	s.fecAccRow = nil
@@ -602,6 +599,7 @@ func (s *Stream) deliverLocked(seq uint32, payload []byte, isFin bool) (ack bool
 		cp := s.reorderGetLocked(len(payload))
 		copy(cp, payload)
 		s.reorder[seq] = cp
+		s.reorderAckSeqs = append(s.reorderAckSeqs, seq)
 		s.reorderBytes += len(payload)
 		s.conn.statReorder.Add(1)
 		s.maybeFastRetransmitLocked()
@@ -751,6 +749,7 @@ func (s *Stream) drainReorderLocked() {
 		}
 		s.ringWrite(data)
 		delete(s.reorder, s.readSeq)
+		s.reorderAckDead++
 		s.reorderBytes -= len(data)
 		if s.conn.cfg.fecGroup > 0 {
 			// The frame moves from the reorder map (where reconstruction
@@ -758,6 +757,11 @@ func (s *Stream) drainReorderLocked() {
 			s.fecFoldRecvLocked(s.readSeq, data)
 		}
 		s.reorderPutLocked(data)
+		if len(s.reorder) == 0 {
+			s.reorderAckSeqs = s.reorderAckSeqs[:0]
+			s.reorderAckPos = 0
+			s.reorderAckDead = 0
+		}
 		s.readSeq++
 		s.readCond.Broadcast()
 	}
@@ -1147,14 +1151,15 @@ func (s *Stream) maybeGrowLocked() {
 	s.grantLocked(newCap - oldCap)
 }
 
-// maxNackSeqsPerFire bounds how many missing frames one NACK asks for (the
-// wire format caps it further at one frame's seq capacity). A large window
+// maxNackSeqsPerFire bounds how many missing frames one loss-detection firing
+// asks for. The volley is split across existing-format NACK frames as needed.
+// A large window
 // on a lossy link can hold hundreds of concurrent gaps; a small volley
 // fast-retransmits only the head-most few and leaves the rest to the far
 // slower RTO timer, so the budget should comfortably exceed the plausible
 // concurrent-loss population. Over-asking is cheap since the sender
 // suppresses resends of anything re-sent within the last ¾·SRTT (see
-// retransmitQueue.getForResend) — a mistaken or repeated volley no longer
+// retransmitQueue.requestForResend) — a mistaken or repeated volley no longer
 // multiplies duplicate traffic.
 const maxNackSeqsPerFire = 1024
 
@@ -1227,9 +1232,6 @@ func (s *Stream) maybeTailNack(now time.Time) {
 func (s *Stream) fireNackLocked() {
 	gaps := s.nackScratch[:0]
 	max := maxNackSeqsPerFire
-	if lim := maxAckSeqsPerFrame(s.conn.cfg.maxPayload); max > lim {
-		max = lim
-	}
 	hi := s.maxSeenSeq
 	if s.finRecvd && s.finSeq > 0 && s.finSeq-1 > hi {
 		hi = s.finSeq - 1
@@ -1241,7 +1243,7 @@ func (s *Stream) fireNackLocked() {
 	}
 	s.nackScratch = gaps
 	if len(gaps) > 0 {
-		s.conn.sendNackFrame(s.id, gaps)
+		s.conn.sendNackFrames(s.id, gaps)
 	}
 }
 
@@ -1254,10 +1256,11 @@ func (s *Stream) fireNackLocked() {
 // until the next grant). Because it describes state rather than events,
 // the resulting frames are idempotent: re-advertised on every flush, so
 // any single lost frame is healed by the next one. seqs reuses scratch's
-// backing array and is capped at maxSeqs; when the reorder buffer holds
-// more than maxSeqs frames, Go's randomized map iteration order makes
-// successive snapshots cover different subsets, so every buffered frame
-// still gets acknowledged within a few flushes.
+// backing array and is capped at maxSeqs. reorderAckSeqs is a rotating
+// insertion-order index over the reorder map: it avoids map-iterator setup
+// on every receive batch and ensures successive capped snapshots cover every
+// buffered frame deterministically. Drained index entries are compacted
+// amortized, so the index does not grow for the life of a stream.
 func (s *Stream) ackSnapshot(scratch []uint32, maxSeqs int) (cum uint32, seqs []uint32, granted int64) {
 	s.readMu.Lock()
 	cum = s.readSeq
@@ -1266,11 +1269,29 @@ func (s *Stream) ackSnapshot(scratch []uint32, maxSeqs int) (cum uint32, seqs []
 	if s.finRecvd && s.finSeq >= cum && len(seqs) < maxSeqs {
 		seqs = append(seqs, s.finSeq)
 	}
-	for seq := range s.reorder {
-		if len(seqs) >= maxSeqs {
-			break
+	if s.reorderAckDead >= 64 && s.reorderAckDead*2 >= len(s.reorderAckSeqs) {
+		live := s.reorderAckSeqs[:0]
+		for _, seq := range s.reorderAckSeqs {
+			if _, ok := s.reorder[seq]; ok {
+				live = append(live, seq)
+			}
 		}
-		seqs = append(seqs, seq)
+		s.reorderAckSeqs = live
+		s.reorderAckPos = 0
+		s.reorderAckDead = 0
+	}
+	count := len(s.reorderAckSeqs)
+	if count > 0 && len(seqs) < maxSeqs {
+		start := s.reorderAckPos % count
+		scanned := 0
+		for scanned < count && len(seqs) < maxSeqs {
+			seq := s.reorderAckSeqs[(start+scanned)%count]
+			if _, ok := s.reorder[seq]; ok {
+				seqs = append(seqs, seq)
+			}
+			scanned++
+		}
+		s.reorderAckPos = (start + scanned) % count
 	}
 	s.readMu.Unlock()
 	return

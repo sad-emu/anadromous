@@ -20,50 +20,56 @@ const (
 	// absorbing multi-millisecond receiver stalls and lifting the default
 	// BDP ceiling on long-RTT paths — while a conservatively-tuned system
 	// just grants what it allows.
-	defaultRecvBufSize       = 16 * 1024 * 1024
-	defaultSendBufSize       = 16 * 1024 * 1024
-	defaultBatchSize         = 64 // number of messages per recvmmsg/sendmmsg batch
-	defaultHandshakeTimout   = 5 * time.Second
-	defaultKeepAlive         = 10 * time.Second
-	defaultRetransmitTimeout = 300 * time.Millisecond
-	defaultHandshakeRetryIvl = 250 * time.Millisecond
-	defaultFECGroup          = 8 // see WithFEC
+	defaultRecvBufSize          = 16 * 1024 * 1024
+	defaultSendBufSize          = 16 * 1024 * 1024
+	defaultBatchSize            = 64 // number of messages per recvmmsg/sendmmsg batch
+	defaultHandshakeTimout      = 5 * time.Second
+	defaultKeepAlive            = 10 * time.Second
+	defaultRetransmitTimeout    = 300 * time.Millisecond
+	defaultMinRetransmitTimeout = 150 * time.Millisecond
+	defaultHandshakeRetryIvl    = 250 * time.Millisecond
+	defaultFECGroup             = 8 // see WithFEC
 )
 
 type config struct {
-	maxStreams      int
-	streamBufSize   int
-	recvBufSize     int
-	sendBufSize     int
-	batchSize       int
-	maxPayload      int // max frame payload bytes per datagram
-	handshakeTimout time.Duration
-	keepAlive       time.Duration
-	retransmitTmout time.Duration
-	bindDevice      string // SO_BINDTODEVICE interface name, empty = unbound
-	enableGSO       bool
-	enableIOUring   bool
-	maxInFlight     int  // per-stream cap on sent-but-unACKed bytes
-	fecGroup        int  // DATA frames per FEC parity frame; 0 disables FEC
-	fec2D           bool // add row parity (second FEC dimension) — see WithFEC2D
-	paceRate        int  // sender pacing rate, bytes/sec; 0 = unpaced — see WithPacingRate
-	socketOpts      func(*unet.Socket)
+	maxStreams         int
+	streamBufSize      int
+	recvBufSize        int
+	sendBufSize        int
+	batchSize          int
+	maxPayload         int // max frame payload bytes per datagram
+	handshakeTimout    time.Duration
+	keepAlive          time.Duration
+	retransmitTmout    time.Duration
+	minRetransmitTmout time.Duration
+	bindDevice         string // SO_BINDTODEVICE interface name, empty = unbound
+	enableGSO          bool
+	enableIOUring      bool
+	maxInFlight        int   // per-stream cap on sent-but-unACKed bytes
+	fecGroup           int   // DATA frames per FEC parity frame; 0 disables FEC
+	fec2D              bool  // add row parity (second FEC dimension) — see WithFEC2D
+	paceRate           int64 // legacy/private sender pacing rate; 0 = unpaced — see WithPacingRate
+	paceBurst          int64
+	paceAccounting     WireAccounting
+	wirePacer          *WirePacer // optionally shared by many Connections
+	socketOpts         func(*unet.Socket)
 }
 
 func defaultConfig() config {
 	return config{
-		maxStreams:      defaultMaxStreams,
-		streamBufSize:   defaultStreamBufSize,
-		recvBufSize:     defaultRecvBufSize,
-		sendBufSize:     defaultSendBufSize,
-		batchSize:       defaultBatchSize,
-		maxPayload:      defaultMaxPayloadSize,
-		handshakeTimout: defaultHandshakeTimout,
-		keepAlive:       defaultKeepAlive,
-		retransmitTmout: defaultRetransmitTimeout,
-		enableGSO:       true,
-		enableIOUring:   true,
-		fecGroup:        defaultFECGroup,
+		maxStreams:         defaultMaxStreams,
+		streamBufSize:      defaultStreamBufSize,
+		recvBufSize:        defaultRecvBufSize,
+		sendBufSize:        defaultSendBufSize,
+		batchSize:          defaultBatchSize,
+		maxPayload:         defaultMaxPayloadSize,
+		handshakeTimout:    defaultHandshakeTimout,
+		keepAlive:          defaultKeepAlive,
+		retransmitTmout:    defaultRetransmitTimeout,
+		minRetransmitTmout: defaultMinRetransmitTimeout,
+		enableGSO:          true,
+		enableIOUring:      true,
+		fecGroup:           defaultFECGroup,
 	}
 }
 
@@ -104,6 +110,28 @@ func (c *config) effectiveMaxInFlight() int {
 
 // maxDatagram returns the full datagram buffer size for this config.
 func (c *config) maxDatagram() int { return frameHeaderSize + c.maxPayload }
+
+// pacingEnabled reports whether this endpoint has a provisioned-rate pacer.
+// The distinction matters to the WAN in-flight-window policy even before a
+// Connection has emitted its first batch.
+func (c *config) pacingEnabled() bool {
+	return c.wirePacer != nil || c.paceRate > 0
+}
+
+// ensureWirePacer materializes WithPacingRate's backward-compatible private
+// pacer. Dial calls it once per connection; Listener calls it on a fresh config
+// copy for each accepted connection. Applications explicitly supplying one
+// WirePacer share that pointer instead.
+func (c *config) ensureWirePacer() {
+	if c.wirePacer != nil || c.paceRate <= 0 {
+		return
+	}
+	c.wirePacer = NewWirePacer(WirePacerConfig{
+		RateBytesPerSecond: c.paceRate,
+		BurstBytes:         c.paceBurst,
+		Accounting:         c.paceAccounting,
+	})
+}
 
 // Option configures a Listener or Dial.
 type Option func(*config)
@@ -185,11 +213,22 @@ func WithBindToDevice(ifname string) Option {
 
 // WithRetransmitTimeout sets the initial interval a DATA frame waits for an
 // ACK before being retransmitted, used until enough RTT samples arrive to
-// adapt it (see Connection.updateRTO), and as a floor afterwards so a burst
-// of atypically fast samples can't drive it low enough to cause spurious
-// retransmissions.
+// adapt it (see Connection.updateRTO). The adaptive estimator's floor is
+// configured independently with WithMinRetransmitTimeout.
 func WithRetransmitTimeout(d time.Duration) Option {
 	return func(c *config) { c.retransmitTmout = d }
+}
+
+// WithMinRetransmitTimeout sets the floor for the adaptive retransmission
+// timeout after RTT samples are available. Keeping this separate from the
+// initial timeout lets a connection start conservatively while converging to
+// faster recovery on a stable low-jitter path. The default is 150ms.
+func WithMinRetransmitTimeout(d time.Duration) Option {
+	return func(c *config) {
+		if d > 0 {
+			c.minRetransmitTmout = d
+		}
+	}
 }
 
 // WithMaxBytesInFlight caps how many sent-but-unacknowledged bytes a stream
@@ -290,10 +329,14 @@ func WithFEC2D(enabled bool) Option {
 	return func(c *config) { c.fec2D = enabled }
 }
 
-// WithPacingRate sets the connection's send rate in bytes per second —
-// size it to the link's provisioned capacity. This protocol never backs
-// off: the pacer holds the wire at exactly this rate through any amount of
-// loss, which is what actually keeps a known-capacity pipe 100% utilized.
+// WithPacingRate sets each connection's send rate in bytes per second — size
+// it to the link's provisioned capacity. Applications pooling multiple
+// connections over one circuit should instead create one WirePacer and pass
+// it with WithWirePacer to every Dial or to the Listener.
+//
+// The legacy accounting is encoded UDP payload bytes. Use
+// WithPacingAccounting, or construct a shared WirePacer, to include IP,
+// Ethernet, carrier encapsulation and minimum-frame padding.
 // An UNPACED sender transmits in line-rate bursts (as fast as the CPU and
 // NIC go), and whenever the path's bottleneck is slower than that, its
 // queue overflows and drops — self-inflicted loss that no recovery scheme
@@ -301,8 +344,8 @@ func WithFEC2D(enabled bool) Option {
 // random path loss is then absorbed by FEC/NACK recovery without the rate
 // ever dipping.
 //
-// Retransmissions and FEC parity spend from the same budget (retransmits
-// with priority — they never wait), so the wire rate stays at the
+// Retransmissions and FEC parity spend from the same budget (retransmits are
+// granted ahead of new bulk traffic across a shared pacer), so the wire rate stays at the
 // configured value rather than ballooning past it under loss; new data
 // slows by exactly the overhead being spent on recovery, no more.
 //
@@ -318,7 +361,30 @@ func WithPacingRate(bytesPerSec int) Option {
 		if bytesPerSec < 0 {
 			bytesPerSec = 0
 		}
-		c.paceRate = bytesPerSec
+		c.paceRate = int64(bytesPerSec)
+		c.wirePacer = nil
+	}
+}
+
+// WithPacingAccounting configures carrier-visible bytes charged in addition
+// to each encoded UDP payload when WithPacingRate constructs its pacer.
+func WithPacingAccounting(accounting WireAccounting) Option {
+	return func(c *config) { c.paceAccounting = accounting }
+}
+
+// WithPacingBurstBytes overrides the default two-millisecond batch/token
+// quantum used by WithPacingRate. Values <= 0 select the default.
+func WithPacingBurstBytes(bytes int64) Option {
+	return func(c *config) { c.paceBurst = bytes }
+}
+
+// WithWirePacer injects a caller-owned pacer. Reusing the same pointer across
+// Dial calls is what enforces one aggregate wire budget across a connection
+// pool. The pacer contains no goroutine and needs no Close call.
+func WithWirePacer(pacer *WirePacer) Option {
+	return func(c *config) {
+		c.wirePacer = pacer
+		c.paceRate = 0
 	}
 }
 

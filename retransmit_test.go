@@ -21,9 +21,14 @@ func TestRetransmitQueueAddDue(t *testing.T) {
 	if len(resend) != 1 {
 		t.Fatalf("expected 1 due entry, got %d", len(resend))
 	}
-	if resend[0].streamID != 1 || resend[0].seq != 0 || string(resend[0].data) != "hello" {
+	if resend[0].streamID != 1 || resend[0].seq != 0 {
 		t.Fatalf("unexpected entry: %+v", resend[0])
 	}
+	e, ok := q.takeForResend(resend[0])
+	if !ok || string(e.data) != "hello" {
+		t.Fatalf("takeForResend: ok=%v entry=%+v", ok, e)
+	}
+	q.releaseResendCopy(e.data)
 }
 
 func TestRetransmitQueueAckRemoves(t *testing.T) {
@@ -121,4 +126,46 @@ func TestRetransmitQueueAckCumulative(t *testing.T) {
 	if len(resend) != 2 {
 		t.Fatalf("expected 2 remaining entries, got %d: %+v", len(resend), resend)
 	}
+}
+
+func TestRetransmitRequestDeduplicatesAndRevalidates(t *testing.T) {
+	q := newRetransmitQueue(defaultMaxPayloadSize)
+	q.add(frameData, 7, 11, []byte("payload"))
+
+	req, ok := q.requestForResend(7, 11, 0)
+	if !ok {
+		t.Fatal("expected first request to reserve entry")
+	}
+	if _, ok := q.requestForResend(7, 11, 0); ok {
+		t.Fatal("duplicate request must be suppressed while queued")
+	}
+	if typ, n, ok := q.peekForResend(req); !ok || typ != frameData || n != len("payload") {
+		t.Fatalf("unexpected peek: type=%d len=%d ok=%v", typ, n, ok)
+	}
+
+	// ACK can win while the request waits behind pacing. takeForResend must
+	// revalidate the key rather than retaining the old arena pointer.
+	q.ackOne(7, 11)
+	if _, ok := q.takeForResend(req); ok {
+		t.Fatal("ACKed request must be canceled before send")
+	}
+}
+
+func TestRetransmitTakeCopiesPayload(t *testing.T) {
+	q := newRetransmitQueue(defaultMaxPayloadSize)
+	q.add(frameData, 3, 4, []byte("before"))
+	req, ok := q.requestForResend(3, 4, 0)
+	if !ok {
+		t.Fatal("requestForResend failed")
+	}
+	e, ok := q.takeForResend(req)
+	if !ok {
+		t.Fatal("takeForResend failed")
+	}
+	q.ackOne(3, 4)
+	q.drainPendingFree()
+	if got := string(e.data); got != "before" {
+		t.Fatalf("worker copy changed after original was recycled: %q", got)
+	}
+	q.releaseResendCopy(e.data)
 }

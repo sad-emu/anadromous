@@ -50,6 +50,13 @@ type Connection struct {
 	sendLens    []int             // actual length written into each sendBuf
 	sendN       int               // number of pending messages in current batch
 	iovsPer     int               // iovecs per message slot (2*gsoMaxFrames, or 2 without GSO)
+	// Exact carrier-accounted cost accumulated while frames enter this batch.
+	// GSO frames increment datagrams individually even though they share one
+	// sendmmsg message. The completed aggregate is granted once at flush.
+	sendWireBytes int64
+	sendUDPBytes  int64
+	sendDatagrams int
+	sendPaceClass paceClass
 
 	// io_uring send state (sendMu). uring == nil means the sendmmsg path.
 	uring     *sendRing
@@ -79,6 +86,7 @@ type Connection struct {
 	sAckDirty     map[uint32]struct{} // live streams with arrivals since the last ACK flush (recvMu)
 	ackScratch    []uint32            // reused decode buffer for incoming ACK/NACK frames (recvMu)
 	ackSnapBuf    []uint32            // reused snapshot buffer for outgoing ACK frames (recvMu)
+	resendScratch []retransmitRequest // reused NACK-to-worker batch (recvMu)
 
 	// deadStreams are tombstones for recently removed streams (recvMu).
 	// Late retransmits for them are ACKed and discarded instead of
@@ -99,6 +107,16 @@ type Connection struct {
 	// no-backoff retransmission.
 	retransmit *retransmitQueue
 
+	// resendQueue is an unbounded, de-duplicated work queue of retransmit
+	// keys. NACK handling only appends keys while recvMu is held; the
+	// retransmitLoop revalidates them and builds recovery-priority batches
+	// without holding receive/stream locks. The shared pacer grants each
+	// completed batch when it is flushed.
+	resendMu    sync.Mutex
+	resendQueue []retransmitRequest
+	resendHead  int
+	resendWake  chan struct{}
+
 	// inFlightCapLan/Wan are the two per-stream caps on sent-but-unACKed
 	// bytes that inFlightCap switches between by measured RTT (see that
 	// method for the physics). Fixed at construction: an explicit
@@ -107,15 +125,10 @@ type Connection struct {
 	inFlightCapLan int64
 	inFlightCapWan int64
 
-	// Pacing state (WithPacingRate): a token bucket in bytes, shared by
-	// every stream on the connection. paceTokens may go negative —
-	// retransmissions and parity charge without waiting (loss recovery is
-	// never delayed), and the deficit is repaid by new data waiting longer,
-	// which is what holds the TOTAL wire rate at the configured value.
-	paceMu     sync.Mutex
-	paceTokens int64
-	paceLast   time.Time
-	paceBurst  int64
+	// wirePacer may be shared by every Connection on one bridge. All frame
+	// paths are accounted as they enter a batch and the pacer is visited only
+	// once when that batch is handed to the kernel.
+	wirePacer *WirePacer
 
 	// onClose, if set, is invoked once when the connection closes (used by
 	// Listener to remove the connection from its tracking map).
@@ -126,10 +139,11 @@ type Connection struct {
 	establishedOnce sync.Once
 
 	// connection lifecycle
-	closed   atomic.Bool
-	closeCh  chan struct{}
-	closeErr error
-	doneWg   sync.WaitGroup
+	closed    atomic.Bool
+	closeCh   chan struct{}
+	closeDone chan struct{} // closed after fd/goroutine teardown is complete
+	closeErr  error
+	doneWg    sync.WaitGroup
 
 	// Statuses (accessed from the public API concurrently with readLoop, so
 	// these must be atomic rather than plain fields).
@@ -173,26 +187,18 @@ func newConnection(sock *unet.Socket, fd int, remote unet.Address, connID uint64
 		streams:       make(map[uint32]*Stream, 64),
 		acceptCh:      make(chan *Stream, cfg.maxStreams),
 		closeCh:       make(chan struct{}),
+		closeDone:     make(chan struct{}),
 		isClient:      isClient,
 		retransmit:    newRetransmitQueue(cfg.maxPayload),
+		resendWake:    make(chan struct{}, 1),
 		establishedCh: make(chan struct{}),
 		deadStreams:   make(map[uint32]time.Time),
 		streamFreedCh: make(chan struct{}, 1),
+		wirePacer:     cfg.wirePacer,
+		sendPaceClass: paceBulk,
 	}
 	c.rttMs.Store(-1)
 	c.rtoNs.Store(int64(cfg.retransmitTmout))
-
-	if cfg.paceRate > 0 {
-		// Burst budget ≈ 2ms of line rate: big enough that the sub-ms sleep
-		// granularity and per-batch sends never starve the wire below the
-		// configured rate, small enough that a bottleneck queue sees an
-		// almost perfectly smooth flow rather than line-rate bursts.
-		c.paceBurst = int64(cfg.paceRate) / 500
-		if min := int64(2 * cfg.maxDatagram()); c.paceBurst < min {
-			c.paceBurst = min
-		}
-		c.paceTokens = c.paceBurst
-	}
 
 	// Resolve the in-flight caps; inFlightCap picks between them by
 	// measured RTT, because RTT decides where the window physically lives:
@@ -233,7 +239,7 @@ func newConnection(sock *unet.Socket, fd int, remote unet.Address, connID uint64
 			c.inFlightCapLan = int64(granted / 2)
 			c.inFlightCapWan = int64(granted - granted/4)
 		}
-		if cfg.paceRate > 0 {
+		if cfg.pacingEnabled() {
 			c.inFlightCapWan = int64(1) << 62 // stream-buffer clamp governs
 		}
 	}
@@ -355,14 +361,18 @@ func newConnection(sock *unet.Socket, fd int, remote unet.Address, connID uint64
 
 // start begins the read loop and the background retransmit/keepalive loops.
 func (c *Connection) start() {
-	c.doneWg.Add(1)
-	go c.readLoop()
-
-	c.doneWg.Add(1)
-	go c.retransmitLoop()
-
+	// Register every worker before any of them can observe a queued GOAWAY and
+	// start Close. Incremental Add calls would let the first worker drop the
+	// count to zero while Close is in Wait, followed by a late Add/use of the
+	// already-torn-down socket.
+	workers := 2
 	if c.cfg.keepAlive > 0 {
-		c.doneWg.Add(1)
+		workers++
+	}
+	c.doneWg.Add(workers)
+	go c.readLoop()
+	go c.retransmitLoop()
+	if c.cfg.keepAlive > 0 {
 		go c.keepAliveLoop()
 	}
 }
@@ -386,6 +396,12 @@ func (c *Connection) OpenStream(ctx context.Context) (*Stream, error) {
 	}
 
 	c.streamMu.Lock()
+	// Close may have won after the optimistic check above while OpenStream was
+	// waiting for streamMu. Recheck at the map-mutation linearization point.
+	if c.closed.Load() || c.streams == nil {
+		c.streamMu.Unlock()
+		return nil, ErrClosed
+	}
 	if len(c.streams) >= c.cfg.maxStreams {
 		c.streamMu.Unlock()
 		return nil, ErrMaxStreams
@@ -425,6 +441,12 @@ func (c *Connection) AcceptStream(ctx context.Context) (*Stream, error) {
 	case <-c.closeCh:
 		return nil, ErrClosed
 	case s := <-c.acceptCh:
+		// If closeCh and an already-buffered stream become ready together,
+		// select may choose either arm. Do not publish a stream after teardown
+		// has started.
+		if c.closed.Load() {
+			return nil, ErrClosed
+		}
 		return s, nil
 	}
 }
@@ -439,12 +461,25 @@ func (c *Connection) CloseWithError(code uint64, reason string) error {
 // Close closes the connection and all streams.
 func (c *Connection) Close() error {
 	if !c.closed.CompareAndSwap(false, true) {
+		// Close is synchronous even when another goroutine won the transition.
+		// Listener.Close relies on this when it encounters a connection already
+		// part-way through an individual Close.
+		if c.closeDone != nil {
+			<-c.closeDone
+		}
 		return nil
 	}
-
-	if c.onClose != nil {
-		c.onClose()
+	if c.closeDone != nil {
+		defer close(c.closeDone)
 	}
+
+	// Cancel any bulk/recovery batch currently waiting in the shared pacer
+	// before trying to acquire sendMu below. Without this ordering, Close can
+	// sit behind an arbitrarily long pacing wait and never reach the channel
+	// close that would release it. GOAWAY remains best-effort after cancellation;
+	// when the control reserve cannot grant it immediately, socket shutdown is
+	// what informs the peer.
+	close(c.closeCh)
 
 	// Send GOAWAY to peer (best-effort). The socket is still open at this
 	// point (Shutdown happens below), so this reaches flushSendLocked fine.
@@ -461,20 +496,31 @@ func (c *Connection) Close() error {
 	}
 	c.sendMu.Unlock()
 
-	close(c.closeCh)
+	// Exclude both the dedicated read loop and the Listener's fallback path,
+	// then shut down the connected socket while ingress is excluded. A reader
+	// that was already blocked in RecvMMsg wakes and must reacquire recvMu,
+	// where it observes closed before dispatching a late DATA/FIN.
+	c.recvMu.Lock()
+	c.sock.Shutdown()
 
-	// Close all streams.
+	// Snapshot and clear stream state only after ingress has been fenced. Do
+	// not call into Stream while holding streamMu: application callbacks may
+	// concurrently be unwinding their stream state.
+	var streams []*Stream
 	c.streamMu.Lock()
 	for _, s := range c.streams {
-		s.deliverClose()
+		streams = append(streams, s)
 	}
 	c.streams = nil
 	c.streamMu.Unlock()
+	c.recvMu.Unlock()
 
-	// Shutdown the socket to unblock the read loop.
-	c.sock.Shutdown()
+	for _, s := range streams {
+		s.deliverClose()
+	}
 
-	// Wait for the read loop to exit.
+	// Wait for read/retransmit/keepalive loops to leave before releasing socket
+	// and io_uring storage. recvMu is deliberately not held across this wait.
 	c.doneWg.Wait()
 
 	// Drain and release the io_uring before the socket fd goes away — its
@@ -488,6 +534,13 @@ func (c *Connection) Close() error {
 
 	// Close the socket fd.
 	c.sock.Close()
+
+	// Keep listener-owned connections discoverable until teardown really is
+	// complete. A concurrent Listener.Close can then snapshot this connection
+	// and wait through the synchronous losing-Close path above.
+	if c.onClose != nil {
+		c.onClose()
+	}
 	return nil
 }
 
@@ -516,40 +569,51 @@ func (c *Connection) writeFrameHdr(buf []byte, ftype uint8, streamID, seq uint32
 	return hdrLen
 }
 
-// paceCharge deducts n wire bytes from the pacing bucket. With block=true
-// (the Write path) it sleeps until the balance is non-negative — callers
-// must NOT hold locks that the receive path needs (readMu/writeMu/recvMu),
-// since sleeps here are the pacing itself. With block=false
-// (retransmissions, parity) the charge is immediate and the balance may go
-// negative; new data repays the deficit. No-op when pacing is off.
-func (c *Connection) paceCharge(n int, block bool) {
-	rate := int64(c.cfg.paceRate)
-	if rate <= 0 {
+// accountDatagramLocked adds one final encoded UDP datagram to the current
+// batch's carrier-visible cost. It is intentionally arithmetic-only: the
+// shared pacer's clock, mutex and any wait are visited once by flushSendLocked
+// rather than once per frame. Caller holds sendMu.
+func (c *Connection) accountDatagramLocked(udpBytes int, class paceClass) {
+	if c.wirePacer == nil {
 		return
 	}
-	c.paceMu.Lock()
-	for {
-		now := time.Now()
-		if !c.paceLast.IsZero() {
-			if elapsed := now.Sub(c.paceLast); elapsed > 0 {
-				c.paceTokens += int64(elapsed) * rate / int64(time.Second)
-				if c.paceTokens > c.paceBurst {
-					c.paceTokens = c.paceBurst
-				}
-			}
-		}
-		c.paceLast = now
-		c.paceTokens -= int64(n)
-		n = 0
-		if !block || c.paceTokens >= 0 || c.closed.Load() {
-			c.paceMu.Unlock()
-			return
-		}
-		wait := time.Duration(-c.paceTokens * int64(time.Second) / rate)
-		c.paceMu.Unlock()
-		time.Sleep(wait)
-		c.paceMu.Lock()
+	if c.sendDatagrams == 0 {
+		c.sendPaceClass = class
+	} else if class > c.sendPaceClass {
+		// Mixed classes should have been split before accounting. If a future
+		// caller misses that boundary, fall back to the least-privileged class
+		// so bulk bytes can never inherit a critical/recovery exemption.
+		c.sendPaceClass = class
 	}
+	c.sendUDPBytes += int64(udpBytes)
+	c.sendWireBytes += c.wirePacer.accounting.Cost(udpBytes)
+	c.sendDatagrams++
+}
+
+// splitPacingClassLocked keeps paced batches homogeneous. In particular, an
+// ACK or window update arriving while DATA is pending must not turn all of the
+// DATA into a critical batch that bypasses waiting. Caller holds sendMu and
+// must have finalized any open GSO pack first.
+func (c *Connection) splitPacingClassLocked(class paceClass) error {
+	if c.wirePacer != nil && c.sendDatagrams > 0 && c.sendPaceClass != class {
+		return c.flushSendLocked()
+	}
+	return nil
+}
+
+// pacingBatchFullLocked reports whether the accumulated wire charge has
+// reached the configured burst quantum. Auto-flushing here bounds actual
+// kernel emission; merely acquiring tokens per frame and releasing a much
+// larger sendmmsg/GSO batch would still create a line-rate burst.
+func (c *Connection) pacingBatchFullLocked() bool {
+	return c.wirePacer != nil && c.sendWireBytes >= c.wirePacer.burstBytes
+}
+
+func (c *Connection) resetBatchAccountingLocked() {
+	c.sendWireBytes = 0
+	c.sendUDPBytes = 0
+	c.sendDatagrams = 0
+	c.sendPaceClass = paceBulk
 }
 
 // sendDataFrame queues a DATA frame and records it for retransmission until
@@ -566,12 +630,12 @@ func (c *Connection) sendDataFrame(streamID, seq uint32, payload []byte) error {
 		c.sendMu.Unlock()
 		return err
 	}
-	buf, idx, err := c.acquireSendSlot()
+	buf, idx, err := c.acquireSendSlot(paceBulk)
 	if err != nil {
 		return err
 	}
 	hdrLen := c.writeFrameHdr(buf, frameData, streamID, seq, len(data))
-	return c.commitSendSlotZeroCopy(idx, hdrLen, data)
+	return c.commitSendSlotZeroCopy(idx, hdrLen, data, paceBulk)
 }
 
 // sendFecFrame sends a parity frame covering count DATA frames starting at
@@ -583,16 +647,15 @@ func (c *Connection) sendDataFrame(streamID, seq uint32, payload []byte) error {
 // protection and recovery falls back to NACK/timeout. xorData is copied
 // into the send slot's own buffer (it's the stream's live accumulator).
 func (c *Connection) sendFecFrame(ftype uint8, streamID, base uint32, count, xorLen int, xorData []byte) error {
-	buf, idx, err := c.acquireSendSlot()
+	buf, idx, err := c.acquireSendSlot(paceBulk)
 	if err != nil {
 		return err
 	}
-	c.paceCharge(frameHeaderSize+fecMetaLen+len(xorData), false)
 	meta := uint32(count)<<16 | uint32(xorLen)
 	encodeHeader(buf, ftype, streamID, base, uint32(fecMetaLen+len(xorData)))
 	binary.BigEndian.PutUint32(buf[frameHeaderSize:], meta)
 	copy(buf[frameHeaderSize+fecMetaLen:], xorData)
-	return c.commitSendSlot(idx, frameHeaderSize+fecMetaLen+len(xorData))
+	return c.commitSendSlot(idx, frameHeaderSize+fecMetaLen+len(xorData), paceBulk)
 }
 
 // sendReliableFrame sends a frame immediately and retransmits it until the
@@ -602,12 +665,12 @@ func (c *Connection) sendFecFrame(ftype uint8, streamID, base uint32, count, xor
 // referenced directly on the wire rather than copied again.
 func (c *Connection) sendReliableFrame(ftype uint8, streamID, seq uint32, payload []byte) error {
 	data := c.retransmit.add(ftype, streamID, seq, payload)
-	buf, idx, err := c.acquireSendSlot()
+	buf, idx, err := c.acquireSendSlot(paceCritical)
 	if err != nil {
 		return err
 	}
 	hdrLen := c.writeFrameHdr(buf, ftype, streamID, seq, len(data))
-	if err := c.commitSendSlotZeroCopy(idx, hdrLen, data); err != nil {
+	if err := c.commitSendSlotZeroCopy(idx, hdrLen, data, paceCritical); err != nil {
 		return err
 	}
 	return c.flushSend()
@@ -628,23 +691,23 @@ func (c *Connection) sendWindowUpdate(streamID uint32, offset uint64) error {
 
 // queueWindowUpdate queues a WINDOW_UPDATE frame without flushing.
 func (c *Connection) queueWindowUpdate(streamID uint32, offset uint64) error {
-	buf, idx, err := c.acquireSendSlot()
+	buf, idx, err := c.acquireSendSlot(paceCritical)
 	if err != nil {
 		return err
 	}
 	encodeHeader(buf, frameWindowUpdate, streamID, 0, 8)
 	binary.BigEndian.PutUint64(buf[frameHeaderSize:], offset)
-	return c.commitSendSlot(idx, frameHeaderSize+8)
+	return c.commitSendSlot(idx, frameHeaderSize+8, paceCritical)
 }
 
 // sendControlFrame sends a control frame (no payload) immediately.
 func (c *Connection) sendControlFrame(ftype uint8, streamID, seq uint32) error {
-	buf, idx, err := c.acquireSendSlot()
+	buf, idx, err := c.acquireSendSlot(paceCritical)
 	if err != nil {
 		return err
 	}
 	encodeHeader(buf, ftype, streamID, seq, 0)
-	if err := c.commitSendSlot(idx, frameHeaderSize); err != nil {
+	if err := c.commitSendSlot(idx, frameHeaderSize, paceCritical); err != nil {
 		return err
 	}
 	return c.flushSend()
@@ -663,15 +726,32 @@ func (c *Connection) sendACKFrame(streamID, cumulative uint32, seqs []uint32) er
 // stream (fast retransmit). Same seq-list wire format as ACK.
 // len(seqs) must not exceed maxAckSeqsPerFrame.
 func (c *Connection) sendNackFrame(streamID uint32, seqs []uint32) error {
-	buf, idx, err := c.acquireSendSlot()
+	if err := c.queueNackFrame(streamID, seqs); err != nil {
+		return err
+	}
+	return c.flushSend()
+}
+
+// sendNackFrames emits one logical gap report across as many existing-format
+// NACK frames as necessary, then flushes once. This is wire-compatible with
+// older peers and lets one loss-detection firing request the full recovery
+// budget instead of silently truncating it to one datagram.
+func (c *Connection) sendNackFrames(streamID uint32, seqs []uint32) error {
+	if err := forEachSeqListChunk(seqs, c.cfg.maxPayload, func(chunk []uint32) error {
+		return c.queueNackFrame(streamID, chunk)
+	}); err != nil {
+		return err
+	}
+	return c.flushSend()
+}
+
+func (c *Connection) queueNackFrame(streamID uint32, seqs []uint32) error {
+	buf, idx, err := c.acquireSendSlot(paceCritical)
 	if err != nil {
 		return err
 	}
 	n := encodeSeqListFrame(buf, frameNack, streamID, 0, seqs)
-	if err := c.commitSendSlot(idx, n); err != nil {
-		return err
-	}
-	return c.flushSend()
+	return c.commitSendSlot(idx, n, paceCritical)
 }
 
 // stubbornResendThreshold is the resend attempt from which each further
@@ -684,43 +764,17 @@ func (c *Connection) sendNackFrame(streamID uint32, seqs []uint32) error {
 // squaring down the chance of yet another cycle.
 const stubbornResendThreshold = 2
 
-// queueResendFrame queues one pending frame for retransmission, zero-copy
-// from the retransmit arena and GSO-packed with other resends when packing
-// is on. Stubborn frames (see stubbornResendThreshold) are queued twice, in
-// separate datagrams — two copies packed into one GSO super-packet would be
-// dropped together, defeating the redundancy. Callers flush after queuing a
-// batch.
-func (c *Connection) queueResendFrame(e retransmitEntry) error {
-	if err := c.queueResendCopy(e); err != nil {
-		return err
-	}
-	if e.retries < stubbornResendThreshold {
-		return nil
-	}
-	if c.gsoMaxFrames >= 2 {
-		c.sendMu.Lock()
-		c.closePackLocked() // start a fresh GSO message: separate datagram for the second copy
-		c.sendMu.Unlock()
-	}
-	return c.queueResendCopy(e)
-}
-
+// queueResendCopy copies one worker-owned retransmission into a connection
+// send slot. The slot owns the bytes until sendmmsg/io_uring completes, so
+// the worker can immediately return its temporary arena copy afterwards.
 func (c *Connection) queueResendCopy(e retransmitEntry) error {
-	// Retransmissions charge the pacing budget without waiting: recovery is
-	// never delayed, and the deficit slows new data instead.
-	c.paceCharge(len(e.data)+frameHeaderSize, false)
-	if c.gsoMaxFrames >= 2 {
-		c.sendMu.Lock()
-		err := c.queueFrameGSOLocked(e.ftype, e.streamID, e.seq, e.data)
-		c.sendMu.Unlock()
-		return err
-	}
-	buf, idx, err := c.acquireSendSlot()
+	buf, idx, err := c.acquireSendSlot(paceRecovery)
 	if err != nil {
 		return err
 	}
 	hdrLen := c.writeFrameHdr(buf, e.ftype, e.streamID, e.seq, len(e.data))
-	return c.commitSendSlotZeroCopy(idx, hdrLen, e.data)
+	copy(buf[hdrLen:], e.data)
+	return c.commitSendSlot(idx, hdrLen+len(e.data), paceRecovery)
 }
 
 // queueACKFrame queues an ACK frame without flushing, so a flush of many
@@ -728,20 +782,25 @@ func (c *Connection) queueResendCopy(e retransmitEntry) error {
 // flushPendingAcksLocked) costs one sendmmsg instead of one per frame.
 // len(seqs) must not exceed maxAckSeqsPerFrame.
 func (c *Connection) queueACKFrame(streamID, cumulative uint32, seqs []uint32) error {
-	buf, idx, err := c.acquireSendSlot()
+	buf, idx, err := c.acquireSendSlot(paceCritical)
 	if err != nil {
 		return err
 	}
 	n := encodeAckFrame(buf, streamID, cumulative, seqs)
-	return c.commitSendSlot(idx, n)
+	return c.commitSendSlot(idx, n, paceCritical)
 }
 
-// acquireSendSlot reserves a message slot in the send batch. If the batch is
-// full, it flushes first. Any GSO message being packed is closed so this
-// frame gets its own slot after it, preserving queue order.
-func (c *Connection) acquireSendSlot() (buf []byte, idx int, err error) {
+// acquireSendSlot reserves a message slot in a same-class send batch. If the
+// batch is full or belongs to another pacing class, it flushes first. Any GSO
+// message being packed is closed so this frame gets its own slot after it,
+// preserving queue order.
+func (c *Connection) acquireSendSlot(class paceClass) (buf []byte, idx int, err error) {
 	c.sendMu.Lock()
 	c.closePackLocked()
+	if err = c.splitPacingClassLocked(class); err != nil {
+		c.sendMu.Unlock()
+		return nil, 0, err
+	}
 	if c.sendN >= c.cfg.batchSize {
 		err = c.flushSendLocked()
 		if err != nil {
@@ -758,16 +817,17 @@ func (c *Connection) acquireSendSlot() (buf []byte, idx int, err error) {
 // both already written into the slot's own buffer) to a send slot, flushing
 // only if the batch is now full. Caller holds sendMu (acquired by
 // acquireSendSlot) and this releases it.
-func (c *Connection) commitSendSlot(idx int, n int) error {
+func (c *Connection) commitSendSlot(idx int, n int, class paceClass) error {
 	base := idx * c.iovsPer
 	c.sendEP.Iov[base].Len = uint64(n)
 	c.sendEP.Hdrs[idx].Iovlen = 1
 	c.sendEP.Hdrs[idx].NTransferred = 0
 	c.sendLens[idx] = n
 	c.sendN = idx + 1
+	c.accountDatagramLocked(n, class)
 
 	var err error
-	if c.sendN >= c.cfg.batchSize {
+	if c.sendN >= c.cfg.batchSize || c.pacingBatchFullLocked() {
 		err = c.flushSendLocked()
 	}
 	c.sendMu.Unlock()
@@ -784,7 +844,7 @@ func (c *Connection) commitSendSlot(idx int, n int) error {
 // function's caller (via flushSendLocked) only does after the batch
 // referencing it has already been handed to the kernel. Caller holds sendMu
 // (acquired by acquireSendSlot) and this releases it.
-func (c *Connection) commitSendSlotZeroCopy(idx, hdrLen int, payload []byte) error {
+func (c *Connection) commitSendSlotZeroCopy(idx, hdrLen int, payload []byte, class paceClass) error {
 	base := idx * c.iovsPer
 	c.sendEP.Iov[base].Len = uint64(hdrLen)
 	if len(payload) > 0 {
@@ -797,9 +857,10 @@ func (c *Connection) commitSendSlotZeroCopy(idx, hdrLen int, payload []byte) err
 	c.sendEP.Hdrs[idx].NTransferred = 0
 	c.sendLens[idx] = hdrLen + len(payload)
 	c.sendN = idx + 1
+	c.accountDatagramLocked(hdrLen+len(payload), class)
 
 	var err error
-	if c.sendN >= c.cfg.batchSize {
+	if c.sendN >= c.cfg.batchSize || c.pacingBatchFullLocked() {
 		err = c.flushSendLocked()
 	}
 	c.sendMu.Unlock()
@@ -814,6 +875,12 @@ func (c *Connection) commitSendSlotZeroCopy(idx, hdrLen int, payload []byte) err
 // the last to be exactly gsoSize. Caller holds sendMu; only call when
 // gsoMaxFrames >= 2.
 func (c *Connection) queueFrameGSOLocked(ftype uint8, streamID, seq uint32, payload []byte) error {
+	if c.wirePacer != nil && c.sendDatagrams > 0 && c.sendPaceClass != paceBulk {
+		c.closePackLocked()
+		if err := c.splitPacingClassLocked(paceBulk); err != nil {
+			return err
+		}
+	}
 	if c.packIdx < 0 {
 		if c.sendN >= c.cfg.batchSize {
 			if err := c.flushSendLocked(); err != nil {
@@ -843,11 +910,12 @@ func (c *Connection) queueFrameGSOLocked(ftype uint8, streamID, seq uint32, payl
 	c.packFrames++
 	c.packHdrOff += hdrLen
 	c.packBytes += hdrLen + len(payload)
+	c.accountDatagramLocked(hdrLen+len(payload), paceBulk)
 
 	full := hdrLen+len(payload) >= c.gsoSize
-	if c.packFrames >= c.gsoMaxFrames || !full {
+	if c.packFrames >= c.gsoMaxFrames || !full || c.pacingBatchFullLocked() {
 		c.closePackLocked()
-		if c.sendN >= c.cfg.batchSize {
+		if c.sendN >= c.cfg.batchSize || c.pacingBatchFullLocked() {
 			return c.flushSendLocked()
 		}
 	}
@@ -881,15 +949,25 @@ func (c *Connection) flushSend() error {
 func (c *Connection) flushSendLocked() error {
 	c.closePackLocked()
 	if c.sendN == 0 {
+		c.resetBatchAccountingLocked()
 		return nil
 	}
 	if c.sock.IsShutdown() {
 		c.sendN = 0
+		c.resetBatchAccountingLocked()
 		return ErrClosed
 	}
 
 	n := c.sendN
+	if c.wirePacer != nil {
+		if ok := c.wirePacer.waitBatch(c.sendWireBytes, c.sendUDPBytes, c.sendDatagrams, c.sendPaceClass, c.closeCh); !ok {
+			c.sendN = 0
+			c.resetBatchAccountingLocked()
+			return ErrClosed
+		}
+	}
 	c.sendN = 0
+	c.resetBatchAccountingLocked()
 	if c.uring != nil {
 		return c.flushSendUringLocked(n)
 	}
@@ -960,10 +1038,84 @@ func (c *Connection) flushSendUringLocked(n int) error {
 
 // --- background loops ---
 
-// retransmitLoop periodically resends any reliable frame (DATA, FIN, RESET)
-// that has been outstanding for longer than the configured (fixed,
-// non-backing-off) retransmit timeout, fails streams that exceed the retry
-// budget, garbage-collects finished streams, and expires tombstones.
+// enqueueResends appends de-duplicated retransmit keys to the worker queue.
+// It never waits for pacing or network I/O, so it is safe from handleNack
+// while recvMu is held.
+func (c *Connection) enqueueResends(reqs []retransmitRequest) {
+	if len(reqs) == 0 {
+		return
+	}
+	c.resendMu.Lock()
+	c.resendQueue = append(c.resendQueue, reqs...)
+	c.resendMu.Unlock()
+	select {
+	case c.resendWake <- struct{}{}:
+	default:
+	}
+}
+
+func (c *Connection) popResend() (retransmitRequest, bool) {
+	c.resendMu.Lock()
+	if c.resendHead >= len(c.resendQueue) {
+		c.resendQueue = c.resendQueue[:0]
+		c.resendHead = 0
+		c.resendMu.Unlock()
+		return retransmitRequest{}, false
+	}
+	req := c.resendQueue[c.resendHead]
+	c.resendQueue[c.resendHead] = retransmitRequest{}
+	c.resendHead++
+	// Avoid retaining a large burst's backing array forever once most of it
+	// has drained, while keeping the steady-state path allocation-free.
+	if c.resendHead >= 1024 && c.resendHead*2 >= len(c.resendQueue) {
+		copy(c.resendQueue, c.resendQueue[c.resendHead:])
+		c.resendQueue = c.resendQueue[:len(c.resendQueue)-c.resendHead]
+		c.resendHead = 0
+	}
+	c.resendMu.Unlock()
+	return req, true
+}
+
+// serviceResends drains all currently queued recovery work. It revalidates
+// each request and takes a worker-owned arena copy before queuing it. The
+// completed recovery batch is then granted by the shared pacer during flush;
+// an ACK racing with revalidation can cancel a redundant send without risking
+// an arena use-after-recycle.
+func (c *Connection) serviceResends() bool {
+	queued := false
+	for {
+		req, ok := c.popResend()
+		if !ok {
+			break
+		}
+		_, _, live := c.retransmit.peekForResend(req)
+		if live {
+			e, stillLive := c.retransmit.takeForResend(req)
+			if stillLive {
+				copies := 1
+				if e.retries >= stubbornResendThreshold {
+					copies = 2
+				}
+				for copyNo := 0; copyNo < copies; copyNo++ {
+					if c.queueResendCopy(e) != nil {
+						break
+					}
+					queued = true
+				}
+				c.retransmit.releaseResendCopy(e.data)
+				c.statResends.Add(1)
+			}
+		}
+	}
+	if queued {
+		c.flushSend()
+	}
+	return queued
+}
+
+// retransmitLoop is both the priority resend worker and the periodic RTO
+// scanner. Timer and NACK paths enqueue only keys; this goroutine is the
+// sole code that may block on pacing and emit retransmissions.
 func (c *Connection) retransmitLoop() {
 	defer c.doneWg.Done()
 
@@ -972,24 +1124,18 @@ func (c *Connection) retransmitLoop() {
 	defer ticker.Stop()
 
 	for {
+		if c.serviceResends() {
+			continue
+		}
 		select {
 		case <-c.closeCh:
 			return
+		case <-c.resendWake:
+			continue
 		case <-ticker.C:
 		}
 
-		resend := c.retransmit.due(c.currentRTO())
-
-		for _, e := range resend {
-			if c.queueResendFrame(e) != nil {
-				break // connection is going away
-			}
-		}
-		if len(resend) > 0 {
-			c.statResends.Add(int64(len(resend)))
-			c.flushSend()
-		}
-
+		c.enqueueResends(c.retransmit.due(c.currentRTO()))
 		c.tailNackScan()
 		c.gcStreams()
 	}
@@ -1097,6 +1243,10 @@ func (c *Connection) readLoop() {
 		// (batchSize × 2 atomic ops per syscall) is measurable, and nothing
 		// inside the dispatch path blocks for long.
 		c.recvMu.Lock()
+		if c.closed.Load() {
+			c.recvMu.Unlock()
+			return
+		}
 		for i := 0; i < messages; i++ {
 			nbytes := int(c.recvEP.Hdrs[i].NTransferred)
 			if nbytes < frameHeaderSize {
@@ -1114,7 +1264,22 @@ func (c *Connection) readLoop() {
 // own readLoop batches the lock across a whole recvmmsg batch instead.
 func (c *Connection) handleDatagram(buf []byte) {
 	c.recvMu.Lock()
-	c.handleDatagramLocked(buf)
+	if !c.closed.Load() {
+		c.handleDatagramLocked(buf)
+	}
+	c.recvMu.Unlock()
+}
+
+// handleDatagramAndFlush is the Listener fallback's atomic ingress operation.
+// A pointer loaded from the listener map while teardown is starting may arrive
+// after closed is set; the check under recvMu makes that stale pointer harmless
+// and avoids a separate post-close ACK flush.
+func (c *Connection) handleDatagramAndFlush(buf []byte) {
+	c.recvMu.Lock()
+	if !c.closed.Load() {
+		c.handleDatagramLocked(buf)
+		c.flushPendingAcksLocked()
+	}
 	c.recvMu.Unlock()
 }
 
@@ -1126,6 +1291,9 @@ func (c *Connection) handleDatagram(buf []byte) {
 // frame discards the remainder of the buffer (frame boundaries after it
 // can't be trusted). Caller holds recvMu.
 func (c *Connection) handleDatagramLocked(buf []byte) {
+	if c.closed.Load() {
+		return
+	}
 	for len(buf) >= frameHeaderSize {
 		f, err := decodeFrame(buf)
 		if err != nil {
@@ -1198,7 +1366,9 @@ func (c *Connection) dispatchFrameLocked(f frame) {
 // outside the connection's own readLoop (Listener fallback path).
 func (c *Connection) flushPendingAcks() {
 	c.recvMu.Lock()
-	c.flushPendingAcksLocked()
+	if !c.closed.Load() {
+		c.flushPendingAcksLocked()
+	}
 	c.recvMu.Unlock()
 }
 
@@ -1298,6 +1468,9 @@ func (c *Connection) markAckDirty(streamID uint32) {
 // recently finished, or a stale frame for one of our own old streams), and
 // (nil, false) when it should be dropped without an ACK.
 func (c *Connection) streamForFrame(streamID uint32) (s *Stream, ackDiscard bool) {
+	if c.closed.Load() {
+		return nil, false
+	}
 	c.streamMu.RLock()
 	s, ok := c.streams[streamID]
 	c.streamMu.RUnlock()
@@ -1319,6 +1492,10 @@ func (c *Connection) streamForFrame(streamID uint32) (s *Stream, ackDiscard bool
 
 	// First frame of a new peer-initiated stream: create and hand to Accept.
 	c.streamMu.Lock()
+	if c.closed.Load() || c.streams == nil {
+		c.streamMu.Unlock()
+		return nil, false
+	}
 	if len(c.streams) >= c.cfg.maxStreams {
 		c.streamMu.Unlock()
 		// Refuse: reset both directions so the opener fails fast instead
@@ -1342,12 +1519,12 @@ func (c *Connection) streamForFrame(streamID uint32) (s *Stream, ackDiscard bool
 // sendResetNoQueue fires a RESET frame without retransmit tracking. Used to
 // refuse streams we have no local state for.
 func (c *Connection) sendResetNoQueue(streamID uint32, code uint64) {
-	buf, idx, err := c.acquireSendSlot()
+	buf, idx, err := c.acquireSendSlot(paceCritical)
 	if err != nil {
 		return
 	}
 	n := encodeFrame(buf, frameStreamReset, streamID, 0, resetPayload(code))
-	if c.commitSendSlot(idx, n) == nil {
+	if c.commitSendSlot(idx, n, paceCritical) == nil {
 		c.flushSend()
 	}
 }
@@ -1497,8 +1674,8 @@ func (c *Connection) handleACK(f frame) {
 // path: the peer only NACKs once it has direct evidence of loss (later
 // frames arrived and the gap persisted past the reorder grace), so recovery
 // happens in about one RTT instead of waiting out the timer. Seqs that are
-// already acknowledged, unknown, or resent within the last ¾·SRTT (stale
-// evidence — see getForResend) are silently skipped.
+// already acknowledged, unknown, already queued, or resent within the last
+// ¾·SRTT (stale evidence — see requestForResend) are silently skipped.
 func (c *Connection) handleNack(f frame) {
 	_, seqs, err := decodeSeqListFrame(f, c.ackScratch)
 	if err != nil {
@@ -1506,21 +1683,16 @@ func (c *Connection) handleNack(f frame) {
 	}
 	c.ackScratch = seqs[:0]  // retain capacity (shared with handleACK; both run under recvMu)
 	minAge := c.srtt * 3 / 4 // srtt: handleNack and updateRTO both run under recvMu
-	resent := 0
+	requests := c.resendScratch[:0]
 	for _, seq := range seqs {
-		e, ok := c.retransmit.getForResend(f.streamID, seq, minAge)
+		req, ok := c.retransmit.requestForResend(f.streamID, seq, minAge)
 		if !ok {
 			continue
 		}
-		if c.queueResendFrame(e) != nil {
-			break // connection is going away
-		}
-		resent++
+		requests = append(requests, req)
 	}
-	if resent > 0 {
-		c.statResends.Add(int64(resent))
-		c.flushSend()
-	}
+	c.enqueueResends(requests)
+	c.resendScratch = requests[:0]
 }
 
 // tombstoneTTL is how long a removed stream's ID keeps ACKing late
@@ -1606,6 +1778,7 @@ func Dial(ctx context.Context, addr string, opts ...Option) (*Connection, error)
 	for _, o := range opts {
 		o(&cfg)
 	}
+	cfg.ensureWirePacer()
 
 	host, port, err := parseAddr(addr)
 	if err != nil {
@@ -1618,6 +1791,7 @@ func Dial(ctx context.Context, addr string, opts ...Option) (*Connection, error)
 		ConstructUdp().
 		SetOpt(setRcvBuf(cfg.recvBufSize)).
 		SetOpt(setSndBuf(cfg.sendBufSize)).
+		SetOpt(setKernelPacingRate(cfg.wirePacer), cfg.wirePacer == nil).
 		SetOpt(bindToDevice(cfg.bindDevice), cfg.bindDevice == "")
 
 	if cfg.socketOpts != nil {
@@ -1676,12 +1850,12 @@ func Dial(ctx context.Context, addr string, opts ...Option) (*Connection, error)
 
 func (c *Connection) sendHandshake(connID uint64) error {
 	payload := handshakePayload(connID)
-	buf, idx, err := c.acquireSendSlot()
+	buf, idx, err := c.acquireSendSlot(paceCritical)
 	if err != nil {
 		return err
 	}
 	n := encodeFrame(buf, frameHandshake, 0, 0, payload)
-	if err := c.commitSendSlot(idx, n); err != nil {
+	if err := c.commitSendSlot(idx, n, paceCritical); err != nil {
 		return err
 	}
 	return c.flushSend()
@@ -1735,11 +1909,10 @@ func (c *Connection) updateRTO(sample time.Duration) {
 		c.srtt += (sample - c.srtt) / 8
 	}
 	rto := c.srtt + 4*c.rttvar
-	// cfg.retransmitTmout doubles as a floor: it's the best guess available
-	// before any real samples exist, and afterwards it protects against a
-	// burst of atypically fast samples driving the RTO low enough to cause
-	// spurious retransmissions.
-	if min := c.cfg.retransmitTmout; rto < min {
+	// The initial timeout and adaptive floor are deliberately independent:
+	// start conservatively before the path is known, then permit faster tail
+	// recovery once real RTT/jitter samples exist.
+	if min := c.cfg.minRetransmitTmout; rto < min {
 		rto = min
 	}
 	c.rtoNs.Store(int64(rto))

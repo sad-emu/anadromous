@@ -44,9 +44,19 @@ type retransmitEntry struct {
 	seq      uint32
 	data     []byte // payload copy, owned by the arena — do not retain past removal
 	sentAt   time.Time
-	retries  int // resend attempts so far, diagnostic only
+	retries  int  // resend attempts so far, diagnostic only
+	queued   bool // a retransmit request is waiting in Connection's paced work queue
 
 	prev, next *retransmitEntry // send-order list links, guarded by retransmitQueue.mu
+}
+
+// retransmitRequest identifies an entry reserved for the connection's
+// asynchronous resend worker. It deliberately carries no arena pointer:
+// the entry may be ACKed while the request waits behind the pacer, and the
+// worker revalidates it with takeForResend before copying its payload.
+type retransmitRequest struct {
+	streamID uint32
+	seq      uint32
 }
 
 // retransmitArena is a self-managed free list of fixed-size buffers used to
@@ -116,7 +126,7 @@ type retransmitQueue struct {
 	freeEntries []*retransmitEntry
 	arena       *retransmitArena
 	pendingFree [][]byte
-	scratch     []retransmitEntry // reused due() result; see due
+	scratch     []retransmitRequest // reused due() result; see due
 	// ackedThrough tracks, per stream, the seq below which every entry has
 	// already been swept by a cumulative ACK, so each sweep only visits
 	// newly-covered seqs — O(1) amortized per frame ever sent.
@@ -203,6 +213,7 @@ func (q *retransmitQueue) add(ftype uint8, streamID, seq uint32, payload []byte)
 	e.data = data
 	e.sentAt = now
 	e.retries = 0
+	e.queued = false
 	q.entries[retransmitKey(streamID, seq)] = e
 	q.pushTail(e)
 	q.mu.Unlock()
@@ -354,41 +365,89 @@ func (q *retransmitQueue) drainPendingFreeFirst(n int) {
 	q.mu.Unlock()
 }
 
-// getForResend returns a copy of the pending entry for (streamID, seq) for
-// an immediate fast-retransmit resend, bumping its sentAt/retries exactly
-// like due() would, so the periodic scanner doesn't immediately re-select it
-// too. ok is false if the frame isn't outstanding (already acknowledged, or
-// a stale/unknown NACK), or if it was already (re)sent within minAge — a
+// requestForResend reserves (streamID, seq) for the asynchronous resend
+// worker. It does not retain the entry's arena buffer and does not advance
+// sentAt: both happen only when the worker is actually ready to send. ok is
+// false if the frame isn't outstanding (already acknowledged, or a
+// stale/unknown NACK), if it already has a queued resend, or if it was
+// already (re)sent within minAge — a
 // NACK reflects the receiver's state at least half an RTT ago, so a NACK
 // for a frame that was resent more recently than that is stale evidence,
 // not proof the resend was lost. Repeat NACK volleys for a still-open gap
 // (throttled by a grace much shorter than the RTT) and outright duplicated
 // NACK datagrams would otherwise each trigger a fresh copy of every listed
 // frame. Callers must treat ok=false as a no-op, not an error.
-func (q *retransmitQueue) getForResend(streamID, seq uint32, minAge time.Duration) (e retransmitEntry, ok bool) {
+func (q *retransmitQueue) requestForResend(streamID, seq uint32, minAge time.Duration) (retransmitRequest, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	key := retransmitKey(streamID, seq)
 	entry, found := q.entries[key]
 	if !found {
-		return retransmitEntry{}, false
+		return retransmitRequest{}, false
 	}
-	if minAge > 0 && time.Since(entry.sentAt) < minAge {
-		return retransmitEntry{}, false
+	if entry.queued || (minAge > 0 && time.Since(entry.sentAt) < minAge) {
+		return retransmitRequest{}, false
 	}
-	entry.sentAt = time.Now()
-	entry.retries++
-	// Keep the list ordered by sentAt: this entry was just (about to be)
-	// resent, so it moves to the tail like any other resend.
-	q.unlink(entry)
-	q.pushTail(entry)
-	return *entry, true
+	entry.queued = true
+	return retransmitRequest{streamID: streamID, seq: seq}, true
 }
 
-// due returns a snapshot of entries that have been outstanding (since their
-// last resend) for at least rto. Their sentAt/retries are bumped in place
-// and they move to the list tail, so a subsequent scan won't immediately
-// re-select them.
+// peekForResend returns the wire-relevant shape of a queued request without
+// exposing its arena buffer. The worker uses this to wait for the right
+// number of pacing tokens before takeForResend atomically revalidates and
+// copies the payload. An ACK racing between peek and take merely wastes a
+// few pacing tokens; it can never leave a stale buffer pointer in flight.
+func (q *retransmitQueue) peekForResend(req retransmitRequest) (ftype uint8, dataLen int, ok bool) {
+	q.mu.Lock()
+	entry := q.entries[retransmitKey(req.streamID, req.seq)]
+	if entry != nil && entry.queued {
+		ftype, dataLen, ok = entry.ftype, len(entry.data), true
+	}
+	q.mu.Unlock()
+	return
+}
+
+// takeForResend revalidates a queued request, advances its retransmission
+// state at the moment the paced worker is ready to send, and returns a copy
+// of the payload in an arena slot owned by the caller. Copying here avoids
+// retaining a pointer to an outstanding entry: an ACK can safely remove and
+// recycle the original while the send is being assembled. The caller must
+// return the copy with releaseResendCopy.
+func (q *retransmitQueue) takeForResend(req retransmitRequest) (e retransmitEntry, ok bool) {
+	now := time.Now()
+	q.mu.Lock()
+	entry := q.entries[retransmitKey(req.streamID, req.seq)]
+	if entry == nil || !entry.queued {
+		q.mu.Unlock()
+		return retransmitEntry{}, false
+	}
+	entry.queued = false
+	entry.sentAt = now
+	entry.retries++
+	q.unlink(entry)
+	q.pushTail(entry)
+	e = *entry
+	e.prev, e.next = nil, nil
+	e.queued = false
+	e.data = q.arena.get(len(entry.data))
+	copy(e.data, entry.data)
+	q.mu.Unlock()
+	return e, true
+}
+
+// releaseResendCopy returns the worker-owned payload copy obtained from
+// takeForResend. Resends are copied into a connection send slot before this
+// call, so no sendmmsg/io_uring operation retains this arena pointer.
+func (q *retransmitQueue) releaseResendCopy(data []byte) {
+	q.mu.Lock()
+	q.arena.put(data)
+	q.mu.Unlock()
+}
+
+// due returns requests for entries that have been outstanding (since their
+// last resend) for at least rto. Entries are only marked queued here; their
+// timestamps and retry counters advance in takeForResend when the paced
+// worker actually services them.
 //
 // Because the list is ordered by sentAt (every (re)send moves an entry to
 // the tail stamped with now), the scan walks from the head and stops at the
@@ -400,22 +459,20 @@ func (q *retransmitQueue) getForResend(streamID, seq uint32, minAge time.Duratio
 // The returned slice is scratch storage reused by the next due call — it is
 // only safe to use from a single goroutine (retransmitLoop) and only until
 // the next call.
-func (q *retransmitQueue) due(rto time.Duration) []retransmitEntry {
+func (q *retransmitQueue) due(rto time.Duration) []retransmitRequest {
 	now := time.Now()
 	q.mu.Lock()
-	resend := q.scratch[:0]
-	for scanned := len(q.entries); scanned > 0 && q.head != nil; scanned-- {
-		e := q.head
+	requests := q.scratch[:0]
+	for e := q.head; e != nil; e = e.next {
 		if now.Sub(e.sentAt) < rto {
 			break
 		}
-		e.sentAt = now
-		e.retries++
-		q.unlink(e)
-		q.pushTail(e)
-		resend = append(resend, *e)
+		if !e.queued {
+			e.queued = true
+			requests = append(requests, retransmitRequest{streamID: e.streamID, seq: e.seq})
+		}
 	}
-	q.scratch = resend
+	q.scratch = requests
 	q.mu.Unlock()
-	return resend
+	return requests
 }

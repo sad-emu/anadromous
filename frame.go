@@ -58,6 +58,27 @@ func maxAckSeqsPerFrame(maxPayload int) int {
 	return (maxPayload - 8) / 4
 }
 
+// forEachSeqListChunk visits contiguous slices sized for the existing
+// ACK/NACK seq-list payload. It centralizes multi-frame volleys without
+// allocating or changing the wire format.
+func forEachSeqListChunk(seqs []uint32, maxPayload int, visit func([]uint32) error) error {
+	maxSeqs := maxAckSeqsPerFrame(maxPayload)
+	if maxSeqs <= 0 {
+		return errors.New("seq-list payload has no sequence capacity")
+	}
+	for len(seqs) > 0 {
+		n := len(seqs)
+		if n > maxSeqs {
+			n = maxSeqs
+		}
+		if err := visit(seqs[:n]); err != nil {
+			return err
+		}
+		seqs = seqs[n:]
+	}
+	return nil
+}
+
 // frame represents a decoded frame header plus its payload.
 type frame struct {
 	ftype    uint8

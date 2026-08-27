@@ -6,8 +6,8 @@ import (
 	"time"
 )
 
-func newTestConnectionPair(t *testing.T) (*Connection, *Connection) {
-	ln, err := Listen("127.0.0.1:0")
+func newTestConnectionPair(t *testing.T, opts ...Option) (*Connection, *Connection) {
+	ln, err := Listen("127.0.0.1:0", opts...)
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -19,7 +19,7 @@ func newTestConnectionPair(t *testing.T) (*Connection, *Connection) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	t.Cleanup(cancel)
 
-	clientConn, err := Dial(ctx, addr)
+	clientConn, err := Dial(ctx, addr, opts...)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
