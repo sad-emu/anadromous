@@ -1372,34 +1372,29 @@ func (c *Connection) flushPendingAcks() {
 	c.recvMu.Unlock()
 }
 
-// maxSnapshotFrames caps how many ACK frames one stream's snapshot may
-// spread across per flush. One frame's seq list can be smaller than a
-// heavily reorder-buffered stream's out-of-order set (a big-window lossy
-// link can buffer thousands of frames past a gap); seqs that don't fit go
-// un-ACKed and get pointlessly retransmitted at the RTO — duplicate traffic
-// exactly when the link is already struggling. Four frames cover ~8k seqs
-// per flush and the snapshot's randomized map iteration rotates coverage,
-// so anything still unlisted is acknowledged within a few batches, well
-// inside the RTO.
-const maxSnapshotFrames = 4
-
 // flushPendingAcksLocked sends any accumulated ACKs, chunked to fit the wire
 // format. Called after each receive batch, holding recvMu.
 //
-// Live streams marked dirty this batch get a snapshot ACK — their full
-// receive state (cumulative watermark + out-of-order seqs), idempotent and
-// re-advertised every flush so lost ACK frames self-heal — chunked across
-// up to maxSnapshotFrames frames (each repeating the cumulative watermark,
-// which the sender's swept-once accounting makes free), plus a
-// WINDOW_UPDATE re-advertising the stream's current flow-control watermark
-// so lost grants self-heal the same way. Explicit seq lists (cumulative=0)
-// remain for the paths with no live stream state to snapshot:
+// Live streams marked dirty this batch get their cumulative receive
+// watermark plus the current and previous selective-ACK deltas. Replaying
+// one bounded generation heals a single lost ACK without rebuilding the
+// whole reorder-window snapshot. The seqs are chunked across as many
+// existing-format frames as needed (each repeats the cumulative watermark,
+// whose swept-once accounting makes repeats cheap), plus a WINDOW_UPDATE
+// re-advertising the current flow-control watermark. Explicit seq lists
+// (cumulative=0) remain for the paths with no live stream state to snapshot:
 // dead-stream/tombstone acking and RESET/late-FIN handling. The per-stream
 // slices/buffers are truncated in place and retained so steady-state
 // flushing allocates nothing; removeStream deletes a stream's slots when
 // it goes away.
 func (c *Connection) flushPendingAcksLocked() {
 	maxAcks := maxAckSeqsPerFrame(c.cfg.maxPayload)
+	// WithMaxDatagramSize enforces this invariant. Keep a defensive guard for
+	// directly-constructed internal configs so a zero-sized chunk can never
+	// make the loops below spin without consuming rest.
+	if maxAcks <= 0 {
+		return
+	}
 	queued := false
 
 	for streamID := range c.sAckDirty {
@@ -1407,7 +1402,7 @@ func (c *Connection) flushPendingAcksLocked() {
 		s := c.streams[streamID]
 		c.streamMu.RUnlock()
 		if s != nil {
-			cum, seqs, granted := s.ackSnapshot(c.ackSnapBuf, maxSnapshotFrames*maxAcks)
+			cum, seqs, granted := s.ackSnapshot(c.ackSnapBuf)
 			c.ackSnapBuf = seqs[:0]
 			rest := seqs
 			for {

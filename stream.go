@@ -74,9 +74,8 @@ type Stream struct {
 	readSeq        uint32            // next expected sequence number
 	reorder        map[uint32][]byte // out-of-order frames awaiting earlier seqs
 	reorderBytes   int
-	reorderAckSeqs []uint32                    // insertion-order ACK index; avoids map iteration in ackSnapshot
-	reorderAckPos  int                         // rotating snapshot cursor into reorderAckSeqs
-	reorderAckDead int                         // drained entries retained in reorderAckSeqs until compaction
+	ackPendingSeqs []uint32                    // newly received out-of-order seqs awaiting a selective ACK
+	ackReplaySeqs  []uint32                    // previous selective-ACK delta, replayed once to heal one lost ACK
 	finRecvd       bool                        // peer sent FIN
 	finSeq         uint32                      // seq position of the peer's FIN (== count of data frames)
 	readErr        error                       // sticky read result: io.EOF, ErrStreamReset, ErrStreamClosed
@@ -499,9 +498,8 @@ func (s *Stream) discardReadStateLocked() {
 	s.readHead, s.readTail, s.readLen = 0, 0, 0
 	s.reorder = make(map[uint32][]byte)
 	s.reorderBytes = 0
-	s.reorderAckSeqs = s.reorderAckSeqs[:0]
-	s.reorderAckPos = 0
-	s.reorderAckDead = 0
+	s.ackPendingSeqs = s.ackPendingSeqs[:0]
+	s.ackReplaySeqs = s.ackReplaySeqs[:0]
 	s.fecAcc = nil
 	s.fecPending = nil
 	s.fecAccRow = nil
@@ -547,6 +545,17 @@ func (s *Stream) deliver(seq uint32, payload []byte, isFin bool) (ack bool) {
 // deliverLocked is deliver's body; FEC reconstruction (applyFec) calls it
 // directly to inject a rebuilt frame while already holding readMu.
 func (s *Stream) deliverLocked(seq uint32, payload []byte, isFin bool) (ack bool) {
+	// Queue only receive events that still need a selective ACK after this
+	// delivery has finished. In-order frames (including a gap-closing frame
+	// that drains buffered successors) are covered by the cumulative
+	// watermark. FIN remains explicitly snapshotted below because readSeq is
+	// the next DATA sequence and therefore never advances past FIN itself.
+	defer func() {
+		if ack && !isFin && seq >= s.readSeq {
+			s.ackPendingSeqs = append(s.ackPendingSeqs, seq)
+		}
+	}()
+
 	// While the receive state is gapped (or a FIN is pending), track
 	// arrival times so the tail-NACK scan can detect silence — see
 	// maybeTailNack. Clean in-order flow skips the clock read.
@@ -599,7 +608,6 @@ func (s *Stream) deliverLocked(seq uint32, payload []byte, isFin bool) (ack bool
 		cp := s.reorderGetLocked(len(payload))
 		copy(cp, payload)
 		s.reorder[seq] = cp
-		s.reorderAckSeqs = append(s.reorderAckSeqs, seq)
 		s.reorderBytes += len(payload)
 		s.conn.statReorder.Add(1)
 		s.maybeFastRetransmitLocked()
@@ -749,7 +757,6 @@ func (s *Stream) drainReorderLocked() {
 		}
 		s.ringWrite(data)
 		delete(s.reorder, s.readSeq)
-		s.reorderAckDead++
 		s.reorderBytes -= len(data)
 		if s.conn.cfg.fecGroup > 0 {
 			// The frame moves from the reorder map (where reconstruction
@@ -757,11 +764,6 @@ func (s *Stream) drainReorderLocked() {
 			s.fecFoldRecvLocked(s.readSeq, data)
 		}
 		s.reorderPutLocked(data)
-		if len(s.reorder) == 0 {
-			s.reorderAckSeqs = s.reorderAckSeqs[:0]
-			s.reorderAckPos = 0
-			s.reorderAckDead = 0
-		}
 		s.readSeq++
 		s.readCond.Broadcast()
 	}
@@ -1249,50 +1251,40 @@ func (s *Stream) fireNackLocked() {
 
 // ackSnapshot returns the stream's receive state for ACK frames: the
 // cumulative contiguous watermark (every seq below it received or
-// discarded), the seqs received beyond it — the buffered out-of-order
-// frames, plus the FIN's seq once seen — and the current flow-control
-// watermark granted to the peer (re-advertised alongside the ACKs so a
-// lost WINDOW_UPDATE heals within a batch instead of stalling the sender
-// until the next grant). Because it describes state rather than events,
-// the resulting frames are idempotent: re-advertised on every flush, so
-// any single lost frame is healed by the next one. seqs reuses scratch's
-// backing array and is capped at maxSeqs. reorderAckSeqs is a rotating
-// insertion-order index over the reorder map: it avoids map-iterator setup
-// on every receive batch and ensures successive capped snapshots cover every
-// buffered frame deterministically. Drained index entries are compacted
-// amortized, so the index does not grow for the life of a stream.
-func (s *Stream) ackSnapshot(scratch []uint32, maxSeqs int) (cum uint32, seqs []uint32, granted int64) {
+// discarded), newly received out-of-order seqs beyond it, the FIN seq once
+// seen, and the current flow-control watermark. The cumulative watermark and
+// FIN are idempotent snapshots. Selective ACKs are emitted for the current
+// receive delta and replayed on the next dirty flush; a lost pair still heals
+// when the sender retransmits and the duplicate receipt queues that seq again.
+// This makes work proportional to two receive batches instead of repeatedly
+// scanning and sending the entire reorder window — a dominant CPU cost on
+// high-rate lossy links — while preserving the existing wire format. seqs
+// reuses scratch's backing array. The caller chunks it across wire frames.
+func (s *Stream) ackSnapshot(scratch []uint32) (cum uint32, seqs []uint32, granted int64) {
 	s.readMu.Lock()
 	cum = s.readSeq
 	granted = s.peerOffset
 	seqs = scratch[:0]
-	if s.finRecvd && s.finSeq >= cum && len(seqs) < maxSeqs {
+	if s.finRecvd && s.finSeq >= cum {
 		seqs = append(seqs, s.finSeq)
 	}
-	if s.reorderAckDead >= 64 && s.reorderAckDead*2 >= len(s.reorderAckSeqs) {
-		live := s.reorderAckSeqs[:0]
-		for _, seq := range s.reorderAckSeqs {
-			if _, ok := s.reorder[seq]; ok {
-				live = append(live, seq)
-			}
+	for _, seq := range s.ackReplaySeqs {
+		if seq >= cum {
+			seqs = append(seqs, seq)
 		}
-		s.reorderAckSeqs = live
-		s.reorderAckPos = 0
-		s.reorderAckDead = 0
 	}
-	count := len(s.reorderAckSeqs)
-	if count > 0 && len(seqs) < maxSeqs {
-		start := s.reorderAckPos % count
-		scanned := 0
-		for scanned < count && len(seqs) < maxSeqs {
-			seq := s.reorderAckSeqs[(start+scanned)%count]
-			if _, ok := s.reorder[seq]; ok {
-				seqs = append(seqs, seq)
-			}
-			scanned++
+	for _, seq := range s.ackPendingSeqs {
+		// A gap may have filled later in the same recvmmsg batch. The
+		// cumulative watermark already covers those pending entries.
+		if seq >= cum {
+			seqs = append(seqs, seq)
 		}
-		s.reorderAckPos = (start + scanned) % count
 	}
+	// Rotate without copying: the current delta becomes the one-generation
+	// replay, while the expired replay's storage collects the next delta.
+	expired := s.ackReplaySeqs[:0]
+	s.ackReplaySeqs = s.ackPendingSeqs
+	s.ackPendingSeqs = expired
 	s.readMu.Unlock()
 	return
 }

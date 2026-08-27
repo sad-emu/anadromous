@@ -113,12 +113,11 @@ func encodeFrame(buf []byte, ftype uint8, streamID, seq uint32, payload []byte) 
 //
 // For ACK, Cumulative=C means "every DATA seq below C has been received"
 // and the list holds seqs received beyond C (out-of-order frames, plus the
-// FIN seq once seen); an ACK is therefore an idempotent snapshot of receive
-// state, re-advertised on every flush, so a lost ACK frame is healed by the
-// next one instead of silently un-acknowledging a whole receive batch until
-// the retransmit timer re-sends it — the same reasoning as TCP cumulative
-// ACKs / QUIC ACK ranges. Cumulative=0 makes the frame an explicit-list-only
-// ACK (used for streams with no live receive state: tombstones, resets).
+// FIN seq once seen). Cumulative state is re-advertised on every dirty flush;
+// selective receive deltas are replayed once and are idempotent at the sender,
+// so one lost ACK self-heals without rebuilding the receiver's entire reorder
+// window. Cumulative=0 makes the frame an explicit-list-only ACK (used for
+// streams with no live receive state: tombstones, resets).
 // For NACK the Cumulative field is unused (0) and the list holds the seqs
 // to resend. len(seqs) must not exceed maxAckSeqsPerFrame.
 func encodeSeqListFrame(buf []byte, ftype uint8, streamID, cumulative uint32, seqs []uint32) int {

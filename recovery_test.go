@@ -19,6 +19,19 @@ func TestRetransmitTimeoutOptionsAreIndependent(t *testing.T) {
 	}
 }
 
+func TestMaxDatagramMustFitSelectiveAck(t *testing.T) {
+	cfg := defaultConfig()
+	original := cfg.maxPayload
+	WithMaxDatagramSize(frameHeaderSize + 11)(&cfg)
+	if cfg.maxPayload != original {
+		t.Fatalf("undersized datagram changed max payload to %d, want %d", cfg.maxPayload, original)
+	}
+	WithMaxDatagramSize(frameHeaderSize + 12)(&cfg)
+	if got := maxAckSeqsPerFrame(cfg.maxPayload); got != 1 {
+		t.Fatalf("minimum accepted datagram fits %d selective ACK seqs, want 1", got)
+	}
+}
+
 func TestAdaptiveRTOUsesSeparateFloor(t *testing.T) {
 	cfg := defaultConfig()
 	c := &Connection{cfg: cfg}
@@ -59,7 +72,7 @@ func TestNackVolleySpansExistingFrames(t *testing.T) {
 	}
 }
 
-func newAckIndexTestStream(entries int) *Stream {
+func newAckPendingTestStream(entries int) *Stream {
 	cfg := defaultConfig()
 	c := &Connection{cfg: cfg}
 	s := &Stream{
@@ -69,53 +82,90 @@ func newAckIndexTestStream(entries int) *Stream {
 	for i := 0; i < entries; i++ {
 		seq := uint32(i + 10)
 		s.reorder[seq] = []byte{byte(i)}
-		s.reorderAckSeqs = append(s.reorderAckSeqs, seq)
+		s.ackPendingSeqs = append(s.ackPendingSeqs, seq)
 	}
 	return s
 }
 
-func TestAckSnapshotRotatesWithoutMapIteration(t *testing.T) {
-	s := newAckIndexTestStream(30)
-	_, first, _ := s.ackSnapshot(nil, 10)
+func TestAckSnapshotReplaysOneDeltaWithoutRescanning(t *testing.T) {
+	s := newAckPendingTestStream(30)
+	_, first, _ := s.ackSnapshot(nil)
 	first = append([]uint32(nil), first...)
-	_, second, _ := s.ackSnapshot(nil, 10)
+	_, replay, _ := s.ackSnapshot(nil)
+	_, expired, _ := s.ackSnapshot(nil)
 
-	if len(first) != 10 || len(second) != 10 {
-		t.Fatalf("snapshot lengths = %d, %d; want 10, 10", len(first), len(second))
+	if len(first) != 30 || len(replay) != 30 || len(expired) != 0 {
+		t.Fatalf("snapshot lengths = %d, %d, %d; want 30, 30, 0", len(first), len(replay), len(expired))
 	}
-	seen := make(map[uint32]bool, 20)
-	for _, seq := range first {
-		seen[seq] = true
+	for i, seq := range first {
+		if want := uint32(i + 10); seq != want {
+			t.Fatalf("first snapshot seq[%d] = %d, want %d", i, seq, want)
+		}
 	}
-	for _, seq := range second {
-		if seen[seq] {
-			t.Fatalf("rotating snapshot repeated seq %d before covering remaining entries", seq)
+	for i, seq := range replay {
+		if want := uint32(i + 10); seq != want {
+			t.Fatalf("replay snapshot seq[%d] = %d, want %d", i, seq, want)
+		}
+	}
+	if len(s.ackPendingSeqs) != 0 || len(s.ackReplaySeqs) != 0 {
+		t.Fatalf("pending/replay seqs = %d/%d, want 0/0", len(s.ackPendingSeqs), len(s.ackReplaySeqs))
+	}
+}
+
+func TestAckSnapshotDropsPendingAndReplayCoveredByCumulative(t *testing.T) {
+	s := newAckPendingTestStream(20)
+	s.readSeq = 20
+	_, got, _ := s.ackSnapshot(nil)
+	if len(got) != 10 {
+		t.Fatalf("snapshot contains %d selective seqs, want 10", len(got))
+	}
+	for i, seq := range got {
+		if want := uint32(i + 20); seq != want {
+			t.Fatalf("snapshot seq[%d] = %d, want %d", i, seq, want)
+		}
+	}
+	s.readSeq = 25
+	_, replay, _ := s.ackSnapshot(nil)
+	if len(replay) != 5 {
+		t.Fatalf("replay contains %d selective seqs, want 5", len(replay))
+	}
+	for i, seq := range replay {
+		if want := uint32(i + 25); seq != want {
+			t.Fatalf("replay seq[%d] = %d, want %d", i, seq, want)
 		}
 	}
 }
 
-func TestAckSnapshotCompactsDrainedIndex(t *testing.T) {
-	s := newAckIndexTestStream(200)
-	for i := 0; i < 120; i++ {
-		delete(s.reorder, uint32(i+10))
-		s.reorderAckDead++
+func TestDuplicateOutOfOrderFrameQueuesFreshSelectiveAck(t *testing.T) {
+	s := newAckPendingTestStream(1)
+	_, first, _ := s.ackSnapshot(nil)
+	if len(first) != 1 || first[0] != 10 {
+		t.Fatalf("first snapshot = %v, want [10]", first)
 	}
-	_, got, _ := s.ackSnapshot(nil, 200)
-	if len(got) != 80 {
-		t.Fatalf("snapshot contains %d live entries, want 80", len(got))
+	// Expire the one-generation replay, then model the sender retrying the
+	// frame because both ACK copies were lost.
+	s.ackSnapshot(nil)
+	if !s.deliverLocked(10, []byte{0}, false) {
+		t.Fatal("duplicate buffered frame was not acknowledged")
 	}
-	if len(s.reorderAckSeqs) != 80 || s.reorderAckDead != 0 {
-		t.Fatalf("index after compaction: len=%d dead=%d, want 80/0", len(s.reorderAckSeqs), s.reorderAckDead)
+	_, retry, _ := s.ackSnapshot(nil)
+	if len(retry) != 1 || retry[0] != 10 {
+		t.Fatalf("retry snapshot = %v, want [10]", retry)
 	}
 }
 
-func BenchmarkAckSnapshotIndexed(b *testing.B) {
-	s := newAckIndexTestStream(4096)
-	scratch := make([]uint32, 0, 1024)
+func BenchmarkAckSnapshotPending(b *testing.B) {
+	s := newAckPendingTestStream(0)
+	scratch := make([]uint32, 0, 2048)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, seqs, _ := s.ackSnapshot(scratch, cap(scratch))
+		if len(s.ackPendingSeqs) == 0 {
+			for seq := uint32(10); seq < 1034; seq++ {
+				s.ackPendingSeqs = append(s.ackPendingSeqs, seq)
+			}
+		}
+		_, seqs, _ := s.ackSnapshot(scratch)
 		scratch = seqs[:0]
 	}
 }

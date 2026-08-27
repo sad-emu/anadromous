@@ -195,11 +195,12 @@ func WithIdleTimeout(d time.Duration) Option {
 // payload) used for all frames on the connection. Both endpoints of a
 // connection MUST be configured with the same value: this library targets
 // links whose MTU is known, and does no path-MTU discovery. Values must
-// exceed the frame header overhead; anything else is ignored.
+// fit the frame header plus one selective-ACK entry; anything smaller is
+// ignored.
 // Equivalent to quic-go's InitialPacketSize.
 func WithMaxDatagramSize(n int) Option {
 	return func(c *config) {
-		if n > frameHeaderSize+8 {
+		if n >= frameHeaderSize+12 {
 			c.maxPayload = n - frameHeaderSize
 		}
 	}
